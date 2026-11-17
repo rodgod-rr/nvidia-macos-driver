@@ -79,6 +79,9 @@ static inline FILE *nvmtl_rel_fopen(const char *p, const char *m) {
 #define fopen(p, m) nvmtl_rel_fopen(p, m)
 #endif
 int nvmtl_vk_init(void);
+int nvmtl_vk_lazy_try(void);      /* G15 fork: init preguicoso (nvmtl_vk.c) */
+int nvmtl_vk_query_ok(void);
+int nvmtl_vk_is_lazy(void);
 static uint32_t nvmtl_gl_uniform_index(id function);
 static void nvmtl_gl_uniform_inherit(id function, id source);
 void nvmtl_gl_caps_enable(void);
@@ -977,7 +980,7 @@ static id nvmtl_refuse_before_init(id obj)
     gNVMTLMainDevice = self;
     nvmtl_install_hw_resource_pools(self);
     [self nvmtlProbeGPUPass];
-    if (nvmtl_vk_init()) {
+    if (!nvmtl_vk_lazy_try() && nvmtl_vk_init()) {   /* G15 fork: com a foto, o NVK so inicia no primeiro uso real */
         nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
         return nil;
     }
@@ -1030,7 +1033,7 @@ static id nvmtl_refuse_before_init(id obj)
     return v;
 }
 - (NSString *)name {
-    static int vk = 0; if (!vk) { vk = 1; nvmtl_vk_init(); }
+    static int vk = 0; if (!vk) { vk = 1; if (!nvmtl_vk_is_lazy()) nvmtl_vk_init(); }
     const char *vkname = nvmtl_vk_device_name();
     NSString *full = [NSString stringWithUTF8String:(vkname ? vkname : "NVIDIA GPU")];
     NSRange cut = [full rangeOfString:@" (NVK "];
@@ -2609,10 +2612,10 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return nvmtl_cap_vertex_amplification((uint32_t)MIN(count, (NSUInteger)UINT32_MAX), nvmtl_vk_multiview_views()); }
 // Each answer is the device's own: the format features, sample counts and shader features queried when the Vulkan device was made
 // (nvmtl_caps_query.h). A device without the bit answers NO.
-- (BOOL)supports32BitFloatFiltering { return nvmtl_vk_init() == 0 && nvmtl_vk_cap_float32_filtering(); }
-- (BOOL)supports32BitMSAA { return nvmtl_vk_init() == 0 && nvmtl_vk_cap_float32_msaa(); }
-- (BOOL)supportsPullModelInterpolation { return nvmtl_vk_init() == 0 && nvmtl_vk_cap_pull_model(); }
-- (BOOL)supportsQueryTextureLOD { return nvmtl_cap_query_texture_lod(nvmtl_vk_init() == 0, 1); }   // the translator lowers OpImageQueryLod
+- (BOOL)supports32BitFloatFiltering { return nvmtl_vk_query_ok() && nvmtl_vk_cap_float32_filtering(); }
+- (BOOL)supports32BitMSAA { return nvmtl_vk_query_ok() && nvmtl_vk_cap_float32_msaa(); }
+- (BOOL)supportsPullModelInterpolation { return nvmtl_vk_query_ok() && nvmtl_vk_cap_pull_model(); }
+- (BOOL)supportsQueryTextureLOD { return nvmtl_cap_query_texture_lod(nvmtl_vk_query_ok(), 1); }   // the translator lowers OpImageQueryLod
 // the pipeline builds this driver runs at once (nvmtl_pipeline_compile_width)
 - (NSUInteger)maximumConcurrentCompilationTaskCount { return (NSUInteger)nvmtl_pipeline_compile_width(); }
 - (NSMutableDictionary *)copyIOSurfaceSharedTextureProperties:(MTLTextureDescriptor *)d {

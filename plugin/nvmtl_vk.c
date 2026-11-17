@@ -1661,13 +1661,110 @@ static void nvmtl_vk_note_loss(const char *where, int vkresult, long waited_ms)
     nvlog("vk: every command buffer made in %s from now on records nothing and completes with a device-removed error; objects made before the loss stay inert", getprogname());
     nvmtl_vk_stub_recording();
 }
+/* ---- G15 fork (17/11/2026): init preguicoso ("lazy") ----
+ * Listar as placas (MTLCopyAllDevices) criava o NVK inteiro e acordava a RTX em todo processo Metal. Aqui as
+ * propriedades fixas da placa vem de uma "foto" (Resources/nvmtl-lazy.bin) gravada por um processo que iniciou o NVK
+ * com NVMTL_LAZY_SAVE=1; o NVK so inicia no primeiro uso real (fila, buffer, textura, pipeline...). Sem foto valida
+ * (outra build, outra placa) tudo segue como antes. NVMTL_EAGER=1 e o WindowServer iniciam ja. */
+static int g_lazy;                       /* 1 = foto carregada e o NVK ainda nao iniciado neste processo */
+static uint64_t g_lz_ws, g_lz_rws, g_lz_tsf;
+static void nvmtl_vk_lazy_counts_dummy(void) {}
+#define NVMTL_LZ_VARS(X) X(g_name) X(g_lim) X(g_memp) X(g_sm_count) X(g_timestamp_bits) X(g_sample_locations) X(g_wide) \
+    X(g_rt) X(g_pstat) X(g_provoking) X(g_host_import) X(g_host_align) X(g_dyn3) X(g_clip) X(g_vulkan_memory_model) \
+    X(g_vulkan_memory_device_scope) X(g_uniform_storage16) X(g_topo_any) X(g_tess) X(g_storage16) X(g_sparse_img) \
+    X(g_sparse) X(g_scalar_layout) X(g_sampler_mirror_clamp) X(g_sampler_anisotropy) X(g_qsparse) X(g_qfam) \
+    X(g_occlusion_precise) X(g_mv_views) X(g_mutable) X(g_ms_storage) X(g_max_divisor) X(g_linmod) X(g_indep) \
+    X(g_hz_dynr) X(g_host_query_reset) X(g_float16) X(g_extfd) X(g_dual) X(g_dsr_stencil_modes) X(g_dsr_indep_none) \
+    X(g_dsr_indep) X(g_dsr_depth_modes) X(g_dlss_exts) X(g_divisor) X(g_depth_bounds) X(g_coop_matrix) \
+    X(g_compute_unchecked) X(g_cbuf_stage_limit) X(g_cbuf_limit) X(g_cbuf_dynamic_limit) X(g_cbuf_alignment) \
+    X(g_cap_pull) X(g_cap_f32_msaa) X(g_cap_f32_filter) X(g_budget_ext) X(g_bindless) X(g_bary) X(g_atomic64_shared) \
+    X(g_atomic64_buffer) X(g_a2one) X(g_lz_ws) X(g_lz_rws) X(g_lz_tsf)
+#define NVMTL_LZ_SIZE(v) + sizeof(v)
+static const size_t kLzBytes = 0 NVMTL_LZ_VARS(NVMTL_LZ_SIZE);
+typedef struct { char magic[8]; uint32_t devid, bytes; char stamp[32]; } nvmtl_lz_head;
+static uint32_t nvmtl_lz_devid(void) {   /* device-id do PCI da placa do NVAccel (0 = sem placa) */
+    uint32_t id = 0;
+    io_service_t s = IOServiceGetMatchingService(NVMTL_IO_MAIN_PORT, IOServiceMatching("NVAccel"));
+    io_registry_entry_t e = s, p = 0;
+    for (int i = 0; e && i < 6 && !id; i++) {
+        CFTypeRef d = IORegistryEntryCreateCFProperty(e, CFSTR("device-id"), kCFAllocatorDefault, 0);
+        if (d && CFGetTypeID(d) == CFDataGetTypeID() && CFDataGetLength(d) >= 2) { const UInt8 *b = CFDataGetBytePtr(d); id = b[0] | (b[1] << 8); }
+        if (d) CFRelease(d);
+        if (id || IORegistryEntryGetParentEntry(e, kIOServicePlane, &p) != KERN_SUCCESS) break;
+        if (e != s) IOObjectRelease(e);
+        e = p;
+    }
+    if (e && e != s) IOObjectRelease(e);
+    if (s) IOObjectRelease(s);
+    return id;
+}
+static void nvmtl_lz_head_fill(nvmtl_lz_head *h) {
+    memset(h, 0, sizeof *h); memcpy(h->magic, "G15LAZY1", 8);
+    h->devid = nvmtl_lz_devid(); h->bytes = (uint32_t)kLzBytes;
+    strlcpy(h->stamp, __DATE__ " " __TIME__, sizeof h->stamp);
+}
+static int nvmtl_lz_path(char *out, size_t n) {
+    Dl_info di;
+    if (!dladdr((const void *)nvmtl_vk_lazy_counts_dummy, &di) || !di.dli_fname) return -1;
+    char d[1024]; strlcpy(d, di.dli_fname, sizeof d);
+    char *sl = strrchr(d, '/'); if (!sl) return -1; *sl = 0;          /* .../Contents/MacOS */
+    snprintf(out, n, "%s/../Resources/nvmtl-lazy.bin", d);
+    return 0;
+}
+uint64_t nvmtl_vk_working_set(void);
+uint64_t nvmtl_vk_recommended_working_set(void);
+uint64_t nvmtl_vk_timestamp_frequency(void);
+static void nvmtl_lz_save(void) {
+    char path[1100], tmp[1120];
+    if (nvmtl_lz_path(path, sizeof path)) { nvlog("lazy: no path for the snapshot"); return; }
+    g_lz_ws = nvmtl_vk_working_set(); g_lz_rws = nvmtl_vk_recommended_working_set(); g_lz_tsf = nvmtl_vk_timestamp_frequency();
+    nvmtl_lz_head h; nvmtl_lz_head_fill(&h);
+    snprintf(tmp, sizeof tmp, "%s.%d", path, getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { nvlog("lazy: cannot write %s (run as root)", tmp); printf("lazy: cannot write %s\n", tmp); return; }
+    int ok = fwrite(&h, sizeof h, 1, f) == 1;
+#define NVMTL_LZ_W(v) ok = ok && fwrite(&(v), sizeof(v), 1, f) == 1;
+    NVMTL_LZ_VARS(NVMTL_LZ_W)
+#undef NVMTL_LZ_W
+    ok = (fclose(f) == 0) && ok;
+    if (ok) { chmod(tmp, 0644); ok = rename(tmp, path) == 0; } else unlink(tmp);
+    nvlog("lazy: snapshot %s: %s (device 0x%04x, %u bytes, build %s, \"%s\")", ok ? "SAVED" : "FAILED", path, h.devid, h.bytes, h.stamp, g_name);
+    printf("lazy: snapshot %s: %s (device 0x%04x, %u bytes, \"%s\")\n", ok ? "saved" : "FAILED", path, h.devid, h.bytes, g_name);
+}
+/* chamado no init do dispositivo: 1 = foto carregada (nao iniciar o NVK agora) */
+int nvmtl_vk_lazy_try(void) {
+    if (g_state || g_lazy) return g_lazy;
+    const char *me = getprogname();
+    if (getenv("NVMTL_LAZY_SAVE") || (getenv("NVMTL_EAGER") && getenv("NVMTL_EAGER")[0] == '1') || !strcmp(me, "WindowServer")) return 0;
+    char path[1100]; if (nvmtl_lz_path(path, sizeof path)) return 0;
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    nvmtl_lz_head h, want; nvmtl_lz_head_fill(&want);
+    int ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &want, sizeof h);
+    if (!ok) { fclose(f); nvlog("lazy: snapshot %s is from another build or card - Vulkan starts now", path); return 0; }
+#define NVMTL_LZ_R(v) ok = ok && fread(&(v), sizeof(v), 1, f) == 1;
+    NVMTL_LZ_VARS(NVMTL_LZ_R)
+#undef NVMTL_LZ_R
+    fclose(f);
+    if (!ok) { nvlog("lazy: snapshot %s is short - Vulkan starts now", path); return 0; }
+    g_lazy = 1;
+    nvlog("lazy: %s lists \"%s\" from the snapshot; Vulkan starts on first real use", me, g_name);
+    return 1;
+}
+/* consultas: 1 = ha resposta (NVK iniciado, ou a foto) */
+static int nvmtl_vk_known(void) { return g_state == 1 || (g_state == 0 && g_lazy); }
+int nvmtl_vk_query_ok(void) { if (g_state == 0 && g_lazy) return 1; return nvmtl_vk_init() == 0; }
+int nvmtl_vk_is_lazy(void) { return g_state == 0 && g_lazy; }
+
 int nvmtl_vk_init(void) {
+    const int was = g_state;
     pthread_once(&g_vk_once, nvmtl_vk_initialize_once);
+    if (!was && g_lazy) nvlog("lazy: first real use in %s - Vulkan %s", getprogname(), g_state == 1 ? "up" : "FAILED");
+    { static int saved; if (g_state == 1 && !saved && getenv("NVMTL_LAZY_SAVE")) { saved = 1; nvmtl_lz_save(); } }
     return g_state == 1 ? 0 : -1;
 }
-const char *nvmtl_vk_device_name(void) { return g_state == 1 ? g_name : "(vulkan down)"; }
+const char *nvmtl_vk_device_name(void) { return nvmtl_vk_known() ? g_name : "(vulkan down)"; }
 void nvmtl_vk_limits(uint32_t *layers, uint32_t *shared_bytes, uint32_t wg[3], uint32_t *wg_inv, uint32_t *sm) {
-    int up = g_state == 1;
+    int up = nvmtl_vk_known();
     if (layers) *layers = up ? g_lim.maxImageArrayLayers : 0;
     if (shared_bytes) *shared_bytes = up ? g_lim.maxComputeSharedMemorySize : 0;
     if (wg) { wg[0] = up ? g_lim.maxComputeWorkGroupSize[0] : 0; wg[1] = up ? g_lim.maxComputeWorkGroupSize[1] : 0; wg[2] = up ? g_lim.maxComputeWorkGroupSize[2] : 0; }
@@ -1676,7 +1773,7 @@ void nvmtl_vk_limits(uint32_t *layers, uint32_t *shared_bytes, uint32_t wg[3], u
 }
 
 void nvmtl_vk_pubcaps(uint32_t *color_samples, uint32_t *depth_samples, uint64_t *max_storage_range, uint64_t *linear_align) {
-    int up = g_state == 1;
+    int up = nvmtl_vk_known();
     if (color_samples) *color_samples = up ? (uint32_t)(g_lim.framebufferColorSampleCounts & g_lim.sampledImageColorSampleCounts) : 0;
     if (depth_samples) *depth_samples = up ? (uint32_t)(g_lim.framebufferDepthSampleCounts & g_lim.sampledImageDepthSampleCounts) : 0;
     if (max_storage_range) *max_storage_range = up ? (uint64_t)g_lim.maxStorageBufferRange : 0;
@@ -2452,6 +2549,7 @@ static int nvmtl_ws_full_on(void)
 }
 uint64_t nvmtl_vk_working_set(void)
 {
+    if (nvmtl_vk_is_lazy()) return g_lz_ws;
     if (nvmtl_vk_init()) return nvmtl_ws_full_on() ? 0 : 2ull << 30;
     uint64_t card = nvmtl_vk_vram_bytes();
     uint64_t b = 0, u = 0;
@@ -2485,6 +2583,7 @@ uint64_t nvmtl_vk_working_set(void)
 // where NVK's maxStorageBufferRange was the binding limit, down to 3597 MB.
 uint64_t nvmtl_vk_recommended_working_set(void)
 {
+    if (nvmtl_vk_is_lazy()) return g_lz_rws;
     uint64_t limit = nvmtl_vk_working_set();
     const uint64_t reserve = nvmtl_vk_ws_reserve(), card = nvmtl_vk_vram_bytes();
     // the cap: never more than the card less the reserve, whatever the budget reads at this moment
@@ -2651,7 +2750,7 @@ static int nvmtl_vk_image_create_ms_lifetime_body(uint32_t w, uint32_t h, uint32
 int nvmtl_vk_ms_storage_ok(void) { return g_ms_storage; }
 int nvmtl_vk_sparse_textures_ok(void) { return g_sparse_img; }
 // ticks per second of the GPU timestamps (0 when the device has none); queried once the device exists
-uint64_t nvmtl_vk_timestamp_frequency(void) { return nvmtl_vk_init() ? 0 : nvmtl_ts_frequency((double)g_lim.timestampPeriod, g_timestamp_bits); }
+uint64_t nvmtl_vk_timestamp_frequency(void) { if (nvmtl_vk_is_lazy()) return g_lz_tsf; return nvmtl_vk_init() ? 0 : nvmtl_ts_frequency((double)g_lim.timestampPeriod, g_timestamp_bits); }
 // A 2D (array) image whose memory is bound block by block. Its requirements say where the mip tail starts.
 int nvmtl_vk_image_create_sparse(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, uint32_t mips, uint32_t layers, nvk_image *out)
 {
@@ -4631,7 +4730,7 @@ void nvmtl_vk_parked_samplers_keep(nvk_cmdbuf *c, uint32_t set, uint32_t keep)
     }
 }
 
-int nvmtl_vk_sample_positions_backend(void) { return nvmtl_vk_init() == 0 && g_sample_locations; }
+int nvmtl_vk_sample_positions_backend(void) { return nvmtl_vk_query_ok() && g_sample_locations; }
 int nvmtl_vk_sample_positions_default(uint32_t count, nvmtl_sample_pattern *out)
 {
     /* Without the programmable-position backend the hardware still draws the standard pattern, which is Metal's default.
@@ -9655,8 +9754,8 @@ void nvmtl_vk_cmd_barrier_c2c(nvk_cmdbuf *c)
                           0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-int nvmtl_vk_rt_available(void) { return nvmtl_vk_init() ? 0 : g_rt; }
-int nvmtl_vk_barycentrics_available(void) { return nvmtl_vk_init() ? 0 : g_bary; }
+int nvmtl_vk_rt_available(void) { return nvmtl_vk_query_ok() ? g_rt : 0; }
+int nvmtl_vk_barycentrics_available(void) { return nvmtl_vk_query_ok() ? g_bary : 0; }
 
 // The build-time curve description NVK reads from the pNext chain of a box geometry (nvk/curves/nvk_curve.h, same layout).
 #define NVMTL_VK_STRUCTURE_TYPE_NVK_CURVE_GEOMETRY ((VkStructureType)1000999101)

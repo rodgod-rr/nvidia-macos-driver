@@ -1664,8 +1664,8 @@ static void nvmtl_vk_note_loss(const char *where, int vkresult, long waited_ms)
 /* ---- G15 fork (17/11/2026): init preguicoso ("lazy") ----
  * Listar as placas (MTLCopyAllDevices) criava o NVK inteiro e acordava a RTX em todo processo Metal. Aqui as
  * propriedades fixas da placa vem de uma "foto" (Resources/nvmtl-lazy.bin) gravada por um processo que iniciou o NVK
- * com NVMTL_LAZY_SAVE=1; o NVK so inicia no primeiro uso real (fila, buffer, textura, pipeline...). Sem foto valida
- * (outra build, outra placa) tudo segue como antes. NVMTL_EAGER=1 e o WindowServer iniciam ja. */
+ * com G15_LAZY_SAVE=1 (fora dos prefixos que a build release apaga); o NVK so inicia no primeiro uso real (fila, buffer, textura, pipeline...). Sem foto valida
+ * (outra build, outra placa) tudo segue como antes. G15_NVMTL_EAGER=1 e o WindowServer iniciam ja. */
 static int g_lazy;                       /* 1 = foto carregada e o NVK ainda nao iniciado neste processo */
 static uint64_t g_lz_ws, g_lz_rws, g_lz_tsf;
 static void nvmtl_vk_lazy_counts_dummy(void) {}
@@ -1735,7 +1735,7 @@ static void nvmtl_lz_save(void) {
 int nvmtl_vk_lazy_try(void) {
     if (g_state || g_lazy) return g_lazy;
     const char *me = getprogname();
-    if (getenv("NVMTL_LAZY_SAVE") || (getenv("NVMTL_EAGER") && getenv("NVMTL_EAGER")[0] == '1') || !strcmp(me, "WindowServer")) return 0;
+    if (getenv("G15_LAZY_SAVE") || (getenv("G15_NVMTL_EAGER") && getenv("G15_NVMTL_EAGER")[0] == '1') || !strcmp(me, "WindowServer")) return 0;
     char path[1100]; if (nvmtl_lz_path(path, sizeof path)) return 0;
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     nvmtl_lz_head h, want; nvmtl_lz_head_fill(&want);
@@ -1759,7 +1759,7 @@ int nvmtl_vk_init(void) {
     const int was = g_state;
     pthread_once(&g_vk_once, nvmtl_vk_initialize_once);
     if (!was && g_lazy) nvlog("lazy: first real use in %s - Vulkan %s", getprogname(), g_state == 1 ? "up" : "FAILED");
-    { static int saved; if (g_state == 1 && !saved && getenv("NVMTL_LAZY_SAVE")) { saved = 1; nvmtl_lz_save(); } }
+    { static int saved; if (g_state == 1 && !saved && getenv("G15_LAZY_SAVE")) { saved = 1; nvmtl_lz_save(); } }
     return g_state == 1 ? 0 : -1;
 }
 const char *nvmtl_vk_device_name(void) { return nvmtl_vk_known() ? g_name : "(vulkan down)"; }

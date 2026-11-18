@@ -1,6 +1,6 @@
 --- a/arch/nvalloc/unix/src/dynamic-power.c
 +++ b/arch/nvalloc/unix/src/dynamic-power.c
-@@ -96,6 +96,21 @@
+@@ -96,6 +96,24 @@
  
  // mask holding dynamic power supported GPUs
  static NvU32 dynamicPowerSupportGpuMask = 0;
@@ -10,6 +10,9 @@
 +static volatile NvU32 g15RefCount[3], g15UnrefCount[3];
 +static volatile NvU64 g15RefCaller[8];
 +static volatile NvU32 g15RefCallerNext;
++// G15: GCx prerequisite checks: [0] runs, [1] control failed, [2] GC6 ok, [3] GCOFF ok, [4] neither; last used FB (MB),
++// last upstream-port-configured, last GCOFF memory gate result
++static volatile NvU32 g15Gcx[5], g15GcxUsedFbMb, g15GcxUpstream, g15GcxFbGate;
 +static void g15NoteRef(nv_dynamic_power_mode_t mode, NvBool bRef, void *caller)
 +{
 +    if ((NvU32)mode < 3)
@@ -22,7 +25,31 @@
  
  //
  // Schedule timer based callback, to check for the complete GPU Idleness.
-@@ -1123,6 +1138,8 @@
+@@ -295,6 +313,8 @@
+     nv_priv_t     *nvp = NV_GET_NV_PRIV(nv);
+ 
+     NV_ASSERT(rmDeviceGpuLockIsOwner(pGpu->gpuInstance));
++
++    g15GcxUpstream = nvp->gc6_upstream_port_configured ? 1 : 2;
+ 
+     /*
+      * If GC6 cannot be achieved (either GC6 is unsupported or the upstream port is not configured),
+@@ -311,9 +331,12 @@
+          * In order to enter GCOFF, the FB memory threshold should be less than gcoff_max_fb_size
+          * and clients of RM should not hold the refcount to prevent GCOFF.
+          */
+-        if (!((memmgrGetUsedRamSize(pGpu, pMemoryManager, &usedFbSize) == NV_OK) &&
++        NvBool bGate = ((memmgrGetUsedRamSize(pGpu, pMemoryManager, &usedFbSize) == NV_OK) &&
+               (usedFbSize <= nvp->dynamic_power.gcoff_max_fb_size) &&
+-              (nvp->dynamic_power.clients_gcoff_disallow_refcount == 0)))
++              (nvp->dynamic_power.clients_gcoff_disallow_refcount == 0));
++        g15GcxUsedFbMb = (NvU32)(usedFbSize >> 20);
++        g15GcxFbGate = bGate ? 1 : 2;
++        if (!bGate)
+         {
+             return NV_FALSE;
+         }
+@@ -1123,6 +1146,8 @@
      {
          return NV_OK;
      }
@@ -31,7 +58,7 @@
  
      acquireDynamicPowerMutex(nvp);
  
-@@ -1321,6 +1338,8 @@
+@@ -1321,6 +1346,8 @@
          return;
      }
  
@@ -40,23 +67,42 @@
      acquireDynamicPowerMutex(nvp);
  
      ref = --nvp->dynamic_power.refcount;
-@@ -3276,4 +3295,38 @@
+@@ -1429,12 +1456,17 @@
+                              (void*)&entryPrerequisiteParams,
+                              sizeof(entryPrerequisiteParams));
+ 
++    g15Gcx[0]++;
+     if (status != NV_OK)
+     {
++        g15Gcx[1]++;
+         NV_PRINTF(LEVEL_ERROR, "NVRM, Failed to get GCx pre-requisite, status=0x%x\n",
+                   status);
+         return NV_FALSE;
+     }
++    if (entryPrerequisiteParams.bIsGC6Satisfied) g15Gcx[2]++;
++    if (entryPrerequisiteParams.bIsGCOFFSatisfied) g15Gcx[3]++;
++    if (!entryPrerequisiteParams.bIsGC6Satisfied && !entryPrerequisiteParams.bIsGCOFFSatisfied) g15Gcx[4]++;
+ 
+     return entryPrerequisiteParams.bIsGC6Satisfied || entryPrerequisiteParams.bIsGCOFFSatisfied;
+ }
+@@ -3276,4 +3308,44 @@
      powerInfo->s0ix_status = pS0ixStatus;
      powerInfo->db_support = pDbStatus;
  }
 +
- 
++
 +/*!
 + * G15 fork (macOS): snapshot of the dynamic power bookkeeping for NVRM (nvrm-dynpm-state). No lock: a debug view.
 + * pOut[0] mode, [1] state, [2] refcount, [3] deferred_idle_enabled, [4] idle check scheduled, [5] idle holdoff,
 + * [6] idle-sustained work queued, [7] clients_gcoff_disallow_refcount, [8..10] refs per mode (never/coarse/fine),
-+ * [11..13] unrefs per mode. pCallers[0..7]: return addresses of the last refs (mode in bits 63:62).
++ * [11..13] unrefs per mode, [14..18] GCx checks (runs, failed, GC6 ok, GCOFF ok, neither), [19] used FB MB,
++ * [20] upstream port configured (1 yes 2 no 0 never checked), [21] GCOFF FB gate (1 pass 2 fail 0 not reached). pCallers[0..7]: return addresses of the last refs (mode in bits 63:62).
 + */
 +void NV_API_CALL rm_xnu_dynamic_power_snapshot(nv_state_t *nv, NvU32 *pOut, NvU64 *pCallers)
 +{
 +    nv_priv_t *nvp = NV_GET_NV_PRIV(nv);
 +    NvU32 i;
-+
+ 
 +    if ((nvp == NULL) || (pOut == NULL))
 +        return;
 +
@@ -73,6 +119,11 @@
 +        pOut[8 + i]  = g15RefCount[i];
 +        pOut[11 + i] = g15UnrefCount[i];
 +    }
++    for (i = 0; i < 5; i++)
++        pOut[14 + i] = g15Gcx[i];
++    pOut[19] = g15GcxUsedFbMb;
++    pOut[20] = g15GcxUpstream;
++    pOut[21] = g15GcxFbGate;
 +    if (pCallers != NULL)
 +    {
 +        for (i = 0; i < 8; i++)

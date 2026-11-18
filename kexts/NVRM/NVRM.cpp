@@ -88,6 +88,7 @@ static bool nvrmMultiGpu(void)
 #include "nv_rtd3_policy.h"
 extern "C" bool nv_xnu_dynpm_on(void);
 extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where);   // nv_xnu_dynpm.cpp
+extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv);
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
 extern "C" void nvrm_power_start(nv_state_t *nv);   // nvrm_power.cpp
 extern "C" void nvrm_power_stop(void);
@@ -2421,6 +2422,11 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         NVRMUtilization *sample = (NVRMUtilization *)p1;
         if (!sample || sample->version != NVRM_UTILIZATION_ABI_VERSION) return kIOReturnBadArgument;
         if (!fUtilizationLock || isInactive()) return kIOReturnNotReady;
+        // G15 fork: do not wake RM's dynamic power state with a sample while it counts the GPU idle (nvrmdynpm=1)
+        if (fPassDone >= 2 && nv_xnu_dynpm_gpu_idle(&fNv)) {
+            static uint32_t skips; if ((++skips % 60) == 1) nv_xnu_dynpm_publish(&fNv, fPCI);
+            return kIOReturnNotReady;
+        }
         int counted = 0;
         if (!nv_xnu_pm_try_enter(&counted)) return kIOReturnNotReady;
         IOLockLock(fUtilizationLock);

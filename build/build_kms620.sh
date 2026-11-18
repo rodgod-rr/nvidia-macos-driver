@@ -1,6 +1,8 @@
 #!/bin/bash
 # build_kms620.sh: NVIDIA's modeset core compiled for macOS (libnvkms.a) from the work tree build_rm620.sh made, which
 # already carries every patch in kexts/NVRM/patches. Same transform as RM, for macOS 15.0.
+# -mfunction-return=thunk-extern is dropped: NVIDIA's Makefile adds it when the compiler accepts it (Apple clang 21 does),
+# and the macOS kernel has no __x86_return_thunk to link the DisplayPort library's returns against.
 # Usage: build_kms620.sh <work dir> (the one build_rm620.sh filled).
 set -uo pipefail
 B=$(cd "${1:?work dir}" && pwd); JOBS=${JOBS:-6}; V=${NV_VERSION:-620.70.06}
@@ -14,7 +16,7 @@ for l in sys.stdin:
     l = l.rstrip("\n")
     cc, rest = l.split(" ", 1)
     tool = {"cc": "clang", "c++": "clang++"}[cc]   # the DisplayPort library is C++
-    print(tool + " -arch x86_64 -mmacosx-version-min=15.0 -mkernel -DNV_DARWIN -fcf-protection=branch " + rest.replace(" -mcmodel=kernel", "").replace(" -fno-pic", ""))' > "$O/compile_cmds.sh"
+    print(tool + " -arch x86_64 -mmacosx-version-min=15.0 -mkernel -DNV_DARWIN -fcf-protection=branch " + rest.replace(" -mcmodel=kernel", "").replace(" -fno-pic", "").replace(" -mfunction-return=thunk-extern", ""))' > "$O/compile_cmds.sh"
 n=$(wc -l < "$O/compile_cmds.sh" | tr -d " "); echo "modeset compile commands: $n"
 # the identity string is a make step (user@host and the date); write the shipped wording instead
 printf '%s\n' 'const char  NV_KMS_ID[] = "nvidia id: NVIDIA UNIX Open Kernel Mode Setting Driver for x86_64 '"$V"' Release Build (NullMoth Systems)";' \

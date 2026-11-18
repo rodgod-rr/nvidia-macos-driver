@@ -29,7 +29,7 @@ CXX_SOURCES=( NVRM.cpp nv_xnu_power.cpp nv_xnu_stubs.cpp nvkms_shaders.cpp nvrm_
               nvrm_power.cpp nvrm_surfshare.cpp os-nvkms-xnu.cpp os-xnu.cpp os-xnu2.cpp )
 # Sources that later trees added and earlier ones do not have (so an older tag can be rebuilt with this script): nv_rtd3.cpp
 # (D3cold monitor) and nvrm_ddc.cpp (DDC/CI). The check below keeps the list honest either way.
-for s in nv_rtd3.cpp nvrm_ddc.cpp; do [ -f "$SRC/$s" ] && CXX_SOURCES+=( "$s" ); done
+for s in nv_rtd3.cpp nvrm_ddc.cpp nv_xnu_dynpm.cpp; do [ -f "$SRC/$s" ] && CXX_SOURCES+=( "$s" ); done
 for f in "$SRC"/*.cpp; do
   b=$(basename "$f"); found=0
   for s in "${CXX_SOURCES[@]}"; do [ "$s" = "$b" ] && found=1; done

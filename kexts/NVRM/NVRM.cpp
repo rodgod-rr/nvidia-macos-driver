@@ -86,6 +86,7 @@ static bool nvrmMultiGpu(void)
     return on == 1;
 }
 #include "nv_rtd3_policy.h"
+extern "C" bool nv_xnu_dynpm_on(void);
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
 extern "C" void nvrm_power_start(nv_state_t *nv);   // nvrm_power.cpp
 extern "C" void nvrm_power_stop(void);
@@ -1914,6 +1915,10 @@ IOReturn NVRM::go(uint32_t pass)
         fIntSrc->enable();
         nv->interrupt_line = (NvU32)msi;
         LOG("MSI %d armed; calling rm_init_adapter() — GSP boot from inside macOS", msi);
+        if (nv_xnu_dynpm_on()) {   // G15 fork: RM dynamic power management (RTD3/GC6), the upstream port has _PR3 (PG01)
+            rm_init_dynamic_power_management(NULL, nv, NV_TRUE);
+            LOG("dynpm: rm_init_dynamic_power_management done (nvrmdynpm=1)");
+        }
         NvBool ok = rm_init_adapter(NULL, nv);
         LOG("rm_init_adapter -> %s", ok ? "OK" : "FAILED");
         nv_xnu_dump_live_allocs();
@@ -1922,6 +1927,7 @@ IOReturn NVRM::go(uint32_t pass)
         fAdapter = true;
         LOG("PASS 2 REACHED: the adapter is up — GSP-RM is running on the card under macOS");
         fPassDone = 2;
+        if (nv_xnu_dynpm_on()) { rm_enable_dynamic_power_management(NULL, nv); LOG("dynpm: rm_enable_dynamic_power_management done"); }
         enableAspmL1();
         rtd3Arm();
         {

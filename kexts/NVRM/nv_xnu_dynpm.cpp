@@ -55,3 +55,14 @@ extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where)
     }
     where->setProperty("nvrm-dynpm-state", b);
 }
+
+// True while RM counts the GPU as idle (idle-instant / sustained / indicated). The utilization sampler asks RM once a
+// second; each RM API call takes a dynamic power reference and puts the state back to in-use, so RM never saw two idle
+// checks (5 s each) in a row and never indicated idle (like nvidia-smi polling on Linux). An idle GPU is at 0 %.
+extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv)
+{
+    if (!nv_xnu_dynpm_on() || !nv) return false;
+    NvU32 v[22] = {};
+    rm_xnu_dynamic_power_snapshot(nv, v, NULL);
+    return v[0] == 2 /* fine */ && v[1] >= 2 /* idle-instant, idle-sustained, idle-indicated */;
+}

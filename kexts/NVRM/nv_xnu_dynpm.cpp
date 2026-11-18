@@ -66,3 +66,11 @@ extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv)
     rm_xnu_dynamic_power_snapshot(nv, v, NULL);
     return v[0] == 2 /* fine */ && v[1] >= 2 /* idle-instant, idle-sustained, idle-indicated */;
 }
+
+// Before indicating idle RM revokes user CPU mappings of the GPU (BAR1/VRAM) and checks they are gone, so a later CPU
+// access faults and wakes the GPU instead of reading a powered-off BAR. Not implemented on macOS yet. OBSERVATION ONLY:
+// with nvrmdynpm=1 the check answers yes so RM can reach "indicate idle"; that is safe only because nv_indicate_idle
+// above powers nothing down. A real GC6 entry needs real revocation (or no user BAR mappings) first.
+static volatile SInt32 nRevoke;
+NV_STATUS NV_API_CALL nv_revoke_gpu_mappings(nv_state_t *) { DYNPM_LOG(nRevoke, "RM revokes GPU mappings (not implemented: observation)"); return NV_OK; }
+NvBool NV_API_CALL nv_get_all_mappings_revoked_locked(nv_state_t *) { return nv_xnu_dynpm_on() ? NV_TRUE : NV_FALSE; }

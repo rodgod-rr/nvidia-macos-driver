@@ -22,8 +22,29 @@ static volatile SInt32 nIdle, nNotIdle, nAllow, nDisallow, nHoldoff, nMmap;
 NvBool NV_API_CALL nv_dynamic_power_available(nv_state_t *) { return nv_xnu_dynpm_on() ? NV_TRUE : NV_FALSE; }
 void NV_API_CALL nv_allow_runtime_suspend(nv_state_t *) { DYNPM_LOG(nAllow, "RM allows runtime suspend"); }
 void NV_API_CALL nv_disallow_runtime_suspend(nv_state_t *) { DYNPM_LOG(nDisallow, "RM disallows runtime suspend"); }
-NV_STATUS NV_API_CALL nv_indicate_idle(nv_state_t *) { DYNPM_LOG(nIdle, "RM indicates IDLE"); return NV_OK; }
-NV_STATUS NV_API_CALL nv_indicate_not_idle(nv_state_t *) { DYNPM_LOG(nNotIdle, "RM indicates NOT idle"); return NV_OK; }
+// G15: RM's idle decision is published on the RTX PCI entry as NVRMIdle (Yes/No) and NVRMIdleCount, from a thread
+// call (the callers hold RM's dynamic power mutex, so no registry work in their context). Nothing is powered down here:
+// G15.app parks the RTX through G15Fan RtxPm (revoke + suspend + GOFF) after NVRMIdle stays Yes long enough, and the
+// G15PM wake hooks bring it back before a client reaches RM. A real GC6 runtime suspend is the next step (docs/RTX-GC6.md).
+#include <kern/thread_call.h>
+static volatile SInt32 gRmIdle;
+static IOPCIDevice *gIdlePci;
+static thread_call_t gIdleCall;
+static void nv_xnu_idle_publish(thread_call_param_t, thread_call_param_t)
+{
+    if (!gIdlePci) return;
+    gIdlePci->setProperty("NVRMIdle", gRmIdle ? kOSBooleanTrue : kOSBooleanFalse);
+    gIdlePci->setProperty("NVRMIdleCount", (unsigned long long)nIdle, 32);
+}
+static void nv_xnu_idle_note(nv_state_t *nv, bool idle)
+{
+    gRmIdle = idle ? 1 : 0;
+    if (!gIdlePci && nv && nv->handle) gIdlePci = ((nv_xnu_pci_slot *)nv->handle)->pci;
+    if (!gIdleCall) gIdleCall = thread_call_allocate(nv_xnu_idle_publish, nullptr);
+    if (gIdleCall) thread_call_enter(gIdleCall);
+}
+NV_STATUS NV_API_CALL nv_indicate_idle(nv_state_t *nv) { DYNPM_LOG(nIdle, "RM indicates IDLE"); nv_xnu_idle_note(nv, true); return NV_OK; }
+NV_STATUS NV_API_CALL nv_indicate_not_idle(nv_state_t *nv) { DYNPM_LOG(nNotIdle, "RM indicates NOT idle"); nv_xnu_idle_note(nv, false); return NV_OK; }
 void NV_API_CALL nv_idle_holdoff(nv_state_t *) { DYNPM_LOG(nHoldoff, "RM idle holdoff"); }
 void NV_API_CALL nv_set_safe_to_mmap_locked(nv_state_t *, NvBool safe) { DYNPM_LOG(nMmap, safe ? "safe to mmap: yes" : "safe to mmap: NO"); }
 

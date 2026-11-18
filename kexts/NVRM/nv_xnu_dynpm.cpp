@@ -26,3 +26,29 @@ NV_STATUS NV_API_CALL nv_indicate_idle(nv_state_t *) { DYNPM_LOG(nIdle, "RM indi
 NV_STATUS NV_API_CALL nv_indicate_not_idle(nv_state_t *) { DYNPM_LOG(nNotIdle, "RM indicates NOT idle"); return NV_OK; }
 void NV_API_CALL nv_idle_holdoff(nv_state_t *) { DYNPM_LOG(nHoldoff, "RM idle holdoff"); }
 void NV_API_CALL nv_set_safe_to_mmap_locked(nv_state_t *, NvBool safe) { DYNPM_LOG(nMmap, safe ? "safe to mmap: yes" : "safe to mmap: NO"); }
+
+// Snapshot of RM's dynamic power bookkeeping (patch 620-g15-dynpm-debug.patch in dynamic-power.c), published on the
+// RTX PCI entry as nvrm-dynpm-state: what keeps the refcount above 0 so RM never indicates idle. Callers are offsets
+// from rm_xnu_dynamic_power_snapshot; nm NVRM gives that symbol's address, add the offset and atos/nm resolves them.
+extern "C" void NV_API_CALL rm_xnu_dynamic_power_snapshot(nv_state_t *nv, NvU32 *pOut, NvU64 *pCallers);
+extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where)
+{
+    if (!nv_xnu_dynpm_on() || !nv || !where) return;
+    NvU32 v[14] = {}; NvU64 c[8] = {};
+    rm_xnu_dynamic_power_snapshot(nv, v, c);
+    static const char *const st[] = { "unknown", "in-use", "idle-instant", "idle-sustained", "idle-indicated" };
+    static const char *const md[] = { "never", "coarse", "fine" };
+    char b[600]; int n;
+    n = snprintf(b, sizeof b, "mode %s | state %s | refcount %d | deferred %u | idlecheck %u | holdoff %u | sustainedq %u | "
+                 "gcoffDisallow %u | console %u | primaryVga %u | ref c/f %u/%u unref c/f %u/%u | cb idle %d notidle %d allow %d disallow %d | callers",
+                 v[0] < 3 ? md[v[0]] : "?", v[1] < 5 ? st[v[1]] : "?", (int)v[2], v[3], v[4], v[5], v[6], v[7],
+                 (unsigned)nv->console_device, (unsigned)nv->primary_vga, v[9], v[10], v[12], v[13],
+                 (int)nIdle, (int)nNotIdle, (int)nAllow, (int)nDisallow);
+    const uintptr_t anchor = (uintptr_t)&rm_xnu_dynamic_power_snapshot;
+    for (int i = 0; i < 8 && n > 0 && n < (int)sizeof b - 32; i++) {
+        if (!c[i]) continue;
+        const uintptr_t a = (uintptr_t)(c[i] & 0x3fffffffffffffffull);
+        n += snprintf(b + n, sizeof b - (size_t)n, " %c%+lld", (c[i] >> 62) == 2 ? 'f' : 'c', (long long)((intptr_t)a - (intptr_t)anchor));
+    }
+    where->setProperty("nvrm-dynpm-state", b);
+}

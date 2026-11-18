@@ -1,0 +1,81 @@
+--- a/arch/nvalloc/unix/src/dynamic-power.c
++++ b/arch/nvalloc/unix/src/dynamic-power.c
+@@ -96,6 +96,21 @@
+ 
+ // mask holding dynamic power supported GPUs
+ static NvU32 dynamicPowerSupportGpuMask = 0;
++
++// G15 fork (macOS): who holds the dynamic power refcount. Counts of ref/unref per mode and the return addresses of the
++// last refs, read by NVRM through rm_xnu_dynamic_power_snapshot() and published as nvrm-dynpm-state.
++static volatile NvU32 g15RefCount[3], g15UnrefCount[3];
++static volatile NvU64 g15RefCaller[8];
++static volatile NvU32 g15RefCallerNext;
++static void g15NoteRef(nv_dynamic_power_mode_t mode, NvBool bRef, void *caller)
++{
++    if ((NvU32)mode < 3)
++    {
++        if (bRef) g15RefCount[mode]++; else g15UnrefCount[mode]++;
++    }
++    if (bRef)
++        g15RefCaller[(g15RefCallerNext++) & 7] = (NvU64)(NvUPtr)caller | ((NvU64)mode << 62);
++}
+ 
+ //
+ // Schedule timer based callback, to check for the complete GPU Idleness.
+@@ -1123,6 +1138,8 @@
+     {
+         return NV_OK;
+     }
++
++    g15NoteRef(mode, NV_TRUE, __builtin_return_address(0));
+ 
+     acquireDynamicPowerMutex(nvp);
+ 
+@@ -1321,6 +1338,8 @@
+         return;
+     }
+ 
++    g15NoteRef(mode, NV_FALSE, __builtin_return_address(0));
++
+     acquireDynamicPowerMutex(nvp);
+ 
+     ref = --nvp->dynamic_power.refcount;
+@@ -3276,4 +3295,38 @@
+     powerInfo->s0ix_status = pS0ixStatus;
+     powerInfo->db_support = pDbStatus;
+ }
++
+ 
++/*!
++ * G15 fork (macOS): snapshot of the dynamic power bookkeeping for NVRM (nvrm-dynpm-state). No lock: a debug view.
++ * pOut[0] mode, [1] state, [2] refcount, [3] deferred_idle_enabled, [4] idle check scheduled, [5] idle holdoff,
++ * [6] idle-sustained work queued, [7] clients_gcoff_disallow_refcount, [8..10] refs per mode (never/coarse/fine),
++ * [11..13] unrefs per mode. pCallers[0..7]: return addresses of the last refs (mode in bits 63:62).
++ */
++void NV_API_CALL rm_xnu_dynamic_power_snapshot(nv_state_t *nv, NvU32 *pOut, NvU64 *pCallers)
++{
++    nv_priv_t *nvp = NV_GET_NV_PRIV(nv);
++    NvU32 i;
++
++    if ((nvp == NULL) || (pOut == NULL))
++        return;
++
++    pOut[0]  = (NvU32)nvp->dynamic_power.mode;
++    pOut[1]  = (NvU32)nvp->dynamic_power.state;
++    pOut[2]  = (NvU32)nvp->dynamic_power.refcount;
++    pOut[3]  = nvp->dynamic_power.deferred_idle_enabled;
++    pOut[4]  = nvp->dynamic_power.idle_precondition_check_callback_scheduled;
++    pOut[5]  = nvp->dynamic_power.b_idle_holdoff;
++    pOut[6]  = nvp->dynamic_power.b_idle_sustained_workitem_queued;
++    pOut[7]  = nvp->dynamic_power.clients_gcoff_disallow_refcount;
++    for (i = 0; i < 3; i++)
++    {
++        pOut[8 + i]  = g15RefCount[i];
++        pOut[11 + i] = g15UnrefCount[i];
++    }
++    if (pCallers != NULL)
++    {
++        for (i = 0; i < 8; i++)
++            pCallers[i] = g15RefCaller[(g15RefCallerNext + i) & 7];
++    }
++}

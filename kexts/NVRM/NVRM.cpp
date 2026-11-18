@@ -87,6 +87,7 @@ static bool nvrmMultiGpu(void)
 }
 #include "nv_rtd3_policy.h"
 extern "C" bool nv_xnu_dynpm_on(void);
+extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where);   // nv_xnu_dynpm.cpp
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
 extern "C" void nvrm_power_start(nv_state_t *nv);   // nvrm_power.cpp
 extern "C" void nvrm_power_stop(void);
@@ -1939,6 +1940,7 @@ IOReturn NVRM::go(uint32_t pass)
                      pi.s0ix_status ? pi.s0ix_status : "?", pi.db_support ? pi.db_support : "?");
             fPCI->setProperty("nvrm-dynpm", b);
             LOG("dynpm: power info: %s", b);
+            nv_xnu_dynpm_publish(nv, fPCI);
         }
         enableAspmL1();
         rtd3Arm();
@@ -2438,6 +2440,7 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         }
         IOLockUnlock(fUtilizationLock);
         nv_xnu_pm_exit(counted);
+        if (ready) nv_xnu_dynpm_publish(&fNv, fPCI);   // G15 fork: refresh nvrm-dynpm-state each sample
         return ok ? kIOReturnSuccess : (ready ? kIOReturnIOError : kIOReturnNotReady);
     }
     if (fn && fn->isEqualTo("NVRMBootRaster")) {

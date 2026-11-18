@@ -1597,10 +1597,29 @@ __attribute__((weak)) NvU32 NV_API_CALL os_string_length(const char *)
     return (NvU32)0;
 }
 
-__attribute__((weak)) NvU32 NV_API_CALL os_strtoul(const char *, char **, NvU32)
+// rm_parse_option_string() turns every nvregdwords=Key=Value value into a number with this. As a stub returning 0 it made
+// every registry option 0 (DynamicPowerManagement=3 arrived as 0, "Disabled"). Same rules as Linux simple_strtoul.
+NvU32 NV_API_CALL os_strtoul(const char *str, char **endp, NvU32 base)
 {
-    NV_XNU_STUB_HIT("os_strtoul");
-    return (NvU32)0;
+    const char *s = str;
+    if (base == 0) {
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+        else if (s[0] == '0') base = 8;
+        else base = 10;
+    } else if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    NvU32 v = 0;
+    for (;; s++) {
+        unsigned d;
+        char c = *s;
+        if (c >= '0' && c <= '9') d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else break;
+        if (d >= base) break;
+        v = v * base + d;
+    }
+    if (endp) *endp = (char *)s;
+    return v;
 }
 
 __attribute__((weak)) NvBool NV_API_CALL os_supports_kernel_suspend_notifiers(void)

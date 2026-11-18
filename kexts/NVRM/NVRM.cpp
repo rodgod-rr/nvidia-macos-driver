@@ -1927,7 +1927,19 @@ IOReturn NVRM::go(uint32_t pass)
         fAdapter = true;
         LOG("PASS 2 REACHED: the adapter is up — GSP-RM is running on the card under macOS");
         fPassDone = 2;
-        if (nv_xnu_dynpm_on()) { rm_enable_dynamic_power_management(NULL, nv); LOG("dynpm: rm_enable_dynamic_power_management done"); }
+        if (nv_xnu_dynpm_on()) {
+            rm_enable_dynamic_power_management(NULL, nv); LOG("dynpm: rm_enable_dynamic_power_management done");
+            // what RM decided (the Linux /proc/driver/nvidia/gpus/*/power view)
+            nv_power_info_t pi = {};
+            rm_get_power_info(NULL, nv, &pi);
+            char b[400];
+            snprintf(b, sizeof b, "dynamic: %s | GC6: %s | GCOFF: %s | video memory: %s | S0ix: %s | Dynamic Boost: %s",
+                     pi.dynamic_power_status ? pi.dynamic_power_status : "?", pi.gc6_support ? pi.gc6_support : "?",
+                     pi.gcoff_support ? pi.gcoff_support : "?", pi.vidmem_power_status ? pi.vidmem_power_status : "?",
+                     pi.s0ix_status ? pi.s0ix_status : "?", pi.db_support ? pi.db_support : "?");
+            fPCI->setProperty("nvrm-dynpm", b);
+            LOG("dynpm: power info: %s", b);
+        }
         enableAspmL1();
         rtd3Arm();
         {

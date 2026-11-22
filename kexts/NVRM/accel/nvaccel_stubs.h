@@ -247,8 +247,6 @@ public:
     enum { kIopSrcSlots = 4 };
     struct NVIopSrc { unsigned id; IOMemoryDescriptor *md; IOMemoryMap *map; } fIopSrc[kIopSrcSlots];
     unsigned fIopNext;
-    const void *iopMapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need);
-    void        iopDropSources();
 };
 OSDefineMetaClassAndStructors(NVDisplayPipe, IOAccelLegacyDisplayPipe)
 #if defined(NMX_ACCEL)   /* b116/b185 (IrisXe fork): the MODERN family classes, as Apple's own Intel driver uses them; nmxmodern=1 */

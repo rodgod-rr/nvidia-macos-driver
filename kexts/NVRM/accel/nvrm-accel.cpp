@@ -3213,7 +3213,7 @@ static bool nvAccelFlatHeld(NVDisplayPipe *pipe, unsigned head, IOSurface *s)
     if (nvSVPend(id, 2, nullptr)) { gFlat[head].held = 0; return false; }
     IOMemoryDescriptor *md = s->getMemoryDescriptor();
     if (!md) return false;
-    const volatile unsigned int *src = (const volatile unsigned int *)pipe->iopMapSurface(id, md, H * P);
+    const volatile unsigned int *src = (const volatile unsigned int *)nvpipe_iopMapSurface(pipe, id, md, H * P);
     if (!src) return false;
     uint32_t smp[64];
     const unsigned long spr = (unsigned long)(P / 4);

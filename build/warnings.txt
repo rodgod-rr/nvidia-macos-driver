@@ -27,3 +27,5 @@ nmdrm-link 0
 primary-selector-link 0
 nmhda-link 0
 nmkbdbacklight-link 0
+nmxaccel 0
+nmxaccel-link 0

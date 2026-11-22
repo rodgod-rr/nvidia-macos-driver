@@ -1716,6 +1716,9 @@ uint64_t nvmtl_vk_recommended_working_set(void);
 uint64_t nvmtl_vk_timestamp_frequency(void);
 static void nvmtl_lz_save(void) {
     char path[1100], tmp[1120];
+    /* g15-intel: so a RTX tem foto; o Vulkan de outra GPU (ANV na UHD) gravaria as propriedades dela com o id da RTX */
+    if (nvmtl_vk_vendor() != 0x10de) { nvlog("lazy: snapshot NOT saved - this process runs Metal on %04x, not the RTX", nvmtl_vk_vendor());
+                                       printf("lazy: snapshot not saved (Metal on %04x, not the RTX)\n", nvmtl_vk_vendor()); return; }
     if (nvmtl_lz_path(path, sizeof path)) { nvlog("lazy: no path for the snapshot"); return; }
     g_lz_ws = nvmtl_vk_working_set(); g_lz_rws = nvmtl_vk_recommended_working_set(); g_lz_tsf = nvmtl_vk_timestamp_frequency();
     nvmtl_lz_head h; nvmtl_lz_head_fill(&h);
@@ -1736,6 +1739,8 @@ int nvmtl_vk_lazy_try(void) {
     if (g_state || g_lazy) return g_lazy;
     const char *me = getprogname();
     if (getenv("G15_LAZY_SAVE") || (getenv("G15_NVMTL_EAGER") && getenv("G15_NVMTL_EAGER")[0] == '1') || !strcmp(me, "WindowServer")) return 0;
+    /* g15-intel: a foto e da RTX (NVK); um processo com o Metal na UHD (NMXAccel, ANV) inicia o Vulkan ja */
+    if (nvmtl_vk_vendor() != 0x10de) return 0;
     char path[1100]; if (nvmtl_lz_path(path, sizeof path)) return 0;
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     nvmtl_lz_head h, want; nvmtl_lz_head_fill(&want);

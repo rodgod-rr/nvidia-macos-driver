@@ -92,6 +92,8 @@ extern "C" int nv_xnu_dynpm_sample_skip(nv_state_t *nv);
 extern "C" void nv_xnu_dynpm_sample_done(nv_state_t *nv);
 extern "C" bool nv_xnu_dynpm_exec(void);                         // nvrmdynpm=2: RM's runtime suspend (GC6) executed
 extern "C" bool nv_xnu_dynpm_gpu_off(void);
+extern "C" bool nv_xnu_dynpm_gpu_off_quiet(void);
+extern "C" uint32_t nv_xnu_dynpm_exit_count(void);
 extern "C" void nv_xnu_dynpm_hold(bool on, const char *why);
 extern "C" void nv_xnu_dynpm_block(bool on, const char *why);
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
@@ -2461,9 +2463,13 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         // Longer than kUtilHangNs is a firmware that stopped answering, not a slow GPU, so the sampler stops for the
         // rest of this boot; a fast failure keeps retrying.
         const uint64_t utilT0 = mach_absolute_time();
+        // G15 fork (nvrmdynpm=2): a sample whose RM call brought the GPU back from GC6 is slow by design, not hung
+        const uint32_t exits0 = nv_xnu_dynpm_exit_count(); const bool wasOff = nv_xnu_dynpm_gpu_off_quiet();
         const bool ok = ready && nvrm_query_utilization(fNv.gpu_id, &fUtilizationState, sample);
         uint64_t utilNs = 0; absolutetime_to_nanoseconds(mach_absolute_time() - utilT0, &utilNs);
-        if (ready && utilNs > kUtilHangNs) {
+        const bool woke = wasOff || nv_xnu_dynpm_exit_count() != exits0;
+        if (ready && utilNs > kUtilHangNs && woke) LOG("utilization: a sample took %llu ms because the GPU came back from GC6 - not a hang", (unsigned long long)(utilNs / 1000000ull));
+        if (ready && utilNs > kUtilHangNs && !woke) {
             fUtilizationStopping = true;
             LOG("utilization: a firmware read took %llu ms (limit %llu) - sampling stopped for this boot so the RM lock is not held again",
                 (unsigned long long)(utilNs / 1000000ull), (unsigned long long)(kUtilHangNs / 1000000ull));

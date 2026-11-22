@@ -359,6 +359,9 @@ extern "C" bool nv_xnu_dynpm_gpu_off(void)
     return true;
 }
 extern "C" bool nv_xnu_dynpm_gpu_off_quiet(void) { return nv_xnu_dynpm_exec() && gPmState != kPmActive; }
+// GC6 exits (and failed ones) so far: a caller timing an RM call can tell that a slow call waited for the GPU to come
+// back (0.4 s without power removal, ~1.2 s with it) instead of a hung firmware.
+extern "C" uint32_t nv_xnu_dynpm_exit_count(void) { return nv_xnu_dynpm_exec() ? gPs.exits + gPs.exitFail : 0; }
 // A kernel reader of the card's registers outside RM (headWatch): hold = usage reference + GPU back if suspended.
 extern "C" void nv_xnu_dynpm_hold(bool on, const char *why)
 {

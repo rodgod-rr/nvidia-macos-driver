@@ -442,6 +442,7 @@ extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where)
     }
     where->setProperty("nvrm-dynpm-state", b);
     nv_xnu_rtd3_publish(where);   // E3: the time in GC6 moves with the sampler's periodic refresh too
+    nv_xnu_rv_publish(where);     // E4: the poll counters too (measured over two refreshes)
 }
 
 // Whether the utilization sample should be skipped. The sampler asks RM once a second; each RM API call takes a dynamic

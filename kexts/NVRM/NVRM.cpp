@@ -89,6 +89,11 @@ static bool nvrmMultiGpu(void)
 extern "C" bool nv_xnu_dynpm_on(void);
 extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where);   // nv_xnu_dynpm.cpp
 extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv);
+extern "C" void nv_xnu_dynpm_sample_done(nv_state_t *nv);
+extern "C" bool nv_xnu_dynpm_exec(void);                         // nvrmdynpm=2: RM's runtime suspend (GC6) executed
+extern "C" bool nv_xnu_dynpm_gpu_off(void);
+extern "C" void nv_xnu_dynpm_hold(bool on, const char *why);
+extern "C" void nv_xnu_dynpm_block(bool on, const char *why);
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
 extern "C" void nvrm_power_start(nv_state_t *nv);   // nvrm_power.cpp
 extern "C" void nvrm_power_stop(void);
@@ -985,6 +990,7 @@ void NVRM::headWatch(void *p0, wait_result_t)
 {
     NVRM *s = (NVRM *)p0;
     nv_state_t *nv = &s->fNv;
+    nv_xnu_dynpm_hold(true, "headWatch");   // G15 fork (nvrmdynpm=2): no GC6 while this reads BAR0 behind RM's back
     IOMemoryDescriptor *md = nv->bars[0].size >= 0x700000
         ? IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)nv->bars[0].cpu_address, 0x700000, kIODirectionIn) : NULL;
     IOMemoryMap *map = md ? md->map(kIOMapInhibitCache) : NULL;
@@ -1027,6 +1033,7 @@ void NVRM::headWatch(void *p0, wait_result_t)
     }
     if (md) md->release();
     kprintf("NVRM-xnu: headwatch: done\n");
+    nv_xnu_dynpm_hold(false, "headWatch");
     s->release();
     thread_terminate(current_thread());
 }
@@ -1944,7 +1951,8 @@ IOReturn NVRM::go(uint32_t pass)
             nv_xnu_dynpm_publish(nv, fPCI);
         }
         enableAspmL1();
-        rtd3Arm();
+        if (nv_xnu_dynpm_exec()) { fPCI->setProperty("NVRMRtd3", kOSBooleanTrue); LOG("dynpm: nvrmdynpm=2 - RM executes the runtime suspend (GC6); nvrtd3 not armed"); }
+        else rtd3Arm();
         {
             NvU32 ramKb = 0, totalKb = 0, qst = 0;
             if (nvrm_query_vram_kb(nv->gpu_id, &ramKb, &totalKb, &qst) && ramKb) {
@@ -1974,6 +1982,7 @@ bool NVRM::interruptFilter(IOFilterInterruptEventSource *src)
 void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 {
     NvU32 needBottomHalf = 0;
+    if (nv_xnu_dynpm_gpu_off()) return;   // G15 fork (nvrmdynpm=2): the card is in GC6, its registers are not to be read
     nv_xnu_isr_thread = current_thread();
     NvBool handled = rm_isr(NULL, &fNv, &needBottomHalf);
     nv_xnu_isr_thread = NULL;
@@ -1983,6 +1992,7 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 
 void NVRM::stop(IOService *provider)
 {
+    nv_xnu_dynpm_block(true, "stop");   // G15 fork (nvrmdynpm=2): out of GC6 for good
     nvrm_power_stop();
     // Keep the lock until free(): another service can retain this object and
     // call its platform interface after stop(), when it must answer NotReady.
@@ -2048,6 +2058,7 @@ void NVRM::systemWillShutdown(IOOptionBits specifier)
     if (!fShutdownHandled && !PE_parse_boot_argn("-nvrmnoshutdown", off, sizeof off) && fPCI) {
         fShutdownHandled = true;
         LOG("shutdown: %s - quiescing the GPU", specifier == kIOMessageSystemWillRestart ? "restart" : "power off");
+        nv_xnu_dynpm_block(true, "shutdown");   // G15 fork (nvrmdynpm=2): out of GC6 before the quiesce, for good
         // The interrupt stays on through the standby, as it does on the system-sleep path this reuses (gpuSuspend turns it
         // off itself once the RM is in standby); it is switched off below, before the BAR layout goes back.
         if (fAdapter && OSAddAtomic(0, &fGpuPm) == kGpuPmRunning) {
@@ -2178,8 +2189,13 @@ IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
 {
     nv_xnu_power_refresh();        // a wake can be a change of power source; this runs before the firmware asks
     const SInt32 pm = OSAddAtomic(0, &fGpuPm);
-    if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) gpuSuspend();
-    else if (ordinal != 0 && pm == kGpuPmSuspended) { nv_rtd3_before_system_resume(); gpuResume(); }
+    // G15 fork (nvrmdynpm=2): out of GC6 and no new runtime suspend before the system sleep touches the card; allowed
+    // again after a good wake
+    if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) { nv_xnu_dynpm_block(true, "system sleep"); gpuSuspend(); }
+    else if (ordinal != 0 && pm == kGpuPmSuspended) {
+        nv_rtd3_before_system_resume(); gpuResume();
+        if (OSAddAtomic(0, &fGpuPm) == kGpuPmRunning) nv_xnu_dynpm_block(false, "wake");
+    }
     else LOG("power: setPowerState %lu (gpu %s, adapter %s) - nothing to do", ordinal,
              pm == kGpuPmRunning ? "running" : pm == kGpuPmSuspended ? "suspended" : "lost", fAdapter ? "up" : "down");
     return kIOPMAckImplied;
@@ -2422,7 +2438,7 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         NVRMUtilization *sample = (NVRMUtilization *)p1;
         if (!sample || sample->version != NVRM_UTILIZATION_ABI_VERSION) return kIOReturnBadArgument;
         if (!fUtilizationLock || isInactive()) return kIOReturnNotReady;
-        // G15 fork: do not wake RM's dynamic power state with a sample while it counts the GPU idle (nvrmdynpm=1)
+        // G15 fork: no sample while RM counts the GPU idle and nobody called it since the last sample (nvrmdynpm>=1)
         if (fPassDone >= 2 && nv_xnu_dynpm_gpu_idle(&fNv)) {
             static uint32_t skips; if ((++skips % 60) == 1) nv_xnu_dynpm_publish(&fNv, fPCI);
             return kIOReturnNotReady;
@@ -2446,7 +2462,7 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         }
         IOLockUnlock(fUtilizationLock);
         nv_xnu_pm_exit(counted);
-        if (ready) nv_xnu_dynpm_publish(&fNv, fPCI);   // G15 fork: refresh nvrm-dynpm-state each sample
+        if (ready) { nv_xnu_dynpm_sample_done(&fNv); nv_xnu_dynpm_publish(&fNv, fPCI); }   // G15 fork: skip base + nvrm-dynpm-state
         return ok ? kIOReturnSuccess : (ready ? kIOReturnIOError : kIOReturnNotReady);
     }
     if (fn && fn->isEqualTo("NVRMBootRaster")) {

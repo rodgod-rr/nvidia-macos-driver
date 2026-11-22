@@ -117,7 +117,96 @@ struct {
     uint32_t entries, exits, enterFail, exitFail, tryAgain, skipped, recursion, failRun, underflow, msiOff, holds;
     uint64_t enterUsLast, enterUsMax, exitUsLast, exitUsMax, offUsTotal, offSince;
     uint32_t lastErr; const char *lastWhy;
+    uint32_t d3, d3Fail, d0Fail, cfgFixes; uint16_t pmcsrOff, pmcsrIn; bool noSoftRst;
 } gPs;
+}
+
+// ---- E3b: config space save/restore and D3hot around GC6 (Linux pci_pm_runtime_suspend/resume: pci_save_state,
+// pci_set_power_state(D3hot); back: D0, pci_restore_state, then the driver's runtime_resume) ----------------------------
+// Our own copy, not IOPCIDevice::saveDeviceState (that is IOPCIFamily's shadow for system sleep). Saved: the header
+// (0x00-0x3f), the PCIe capability control registers, MSI, and the extended Resizable BAR / LTR / L1 PM Substates
+// controls. Restored only where the value read after D0 differs (NoSoftRst=1 devices keep everything; counted as
+// cfgFixes), in Linux's order: PCIe capability, extended caps, header from the top down, MSI last.
+namespace {
+struct CfgSave {
+    bool valid;
+    uint32_t hdr[16];
+    uint8_t pcie, msi; uint16_t devCtl, lnkCtl, devCtl2, lnkCtl2;
+    uint16_t msiCtl; uint32_t msiLo, msiHi; uint16_t msiData; bool msi64;
+    uint16_t rbOff[6]; uint32_t rbCtl[6]; unsigned rbN;
+    uint16_t ltrOff; uint32_t ltr; uint16_t l1ssOff; uint32_t l1ss1, l1ss2;
+} gCfg;
+const uint32_t kD3hotDelayMs = 10;   // PCI PM 1.2: 10 ms after a write to or from D3hot
+}
+static void cfgSave(IOPCIDevice *d)
+{
+    CfgSave &c = gCfg; c = {};
+    for (unsigned i = 0; i < 16; i++) c.hdr[i] = d->configRead32((UInt8)(i * 4));
+    UInt8 off = 0;
+    if (d->findPCICapability(0x10, &off) && off) {
+        c.pcie = off; c.devCtl = d->configRead16((UInt8)(off + 0x08)); c.lnkCtl = d->configRead16((UInt8)(off + 0x10));
+        c.devCtl2 = d->configRead16((UInt8)(off + 0x28)); c.lnkCtl2 = d->configRead16((UInt8)(off + 0x30));
+    }
+    off = 0;
+    if (d->findPCICapability(0x05, &off) && off) {
+        c.msi = off; c.msiCtl = d->configRead16((UInt8)(off + 2)); c.msi64 = (c.msiCtl & 0x80) != 0;
+        c.msiLo = d->configRead32((UInt8)(off + 4));
+        if (c.msi64) { c.msiHi = d->configRead32((UInt8)(off + 8)); c.msiData = d->configRead16((UInt8)(off + 0xc)); }
+        else c.msiData = d->configRead16((UInt8)(off + 8));
+    }
+    for (UInt32 e = 0x100, n = 0; e >= 0x100 && e < 0x1000 && n < 64; n++) {
+        const UInt32 h = d->extendedConfigRead32(e);
+        if (h == 0 || h == 0xffffffffU) break;
+        const UInt32 id = h & 0xffff;
+        if (id == 0x15 && !c.rbN) {
+            const UInt32 nb = (d->extendedConfigRead32(e + 8) >> 5) & 7;
+            for (UInt32 i = 0; i < nb && i < 6; i++) { c.rbOff[i] = (uint16_t)(e + 8 + i * 8); c.rbCtl[i] = d->extendedConfigRead32(c.rbOff[i]); }
+            c.rbN = nb < 6 ? nb : 6;
+        } else if (id == 0x18) { c.ltrOff = (uint16_t)e; c.ltr = d->extendedConfigRead32(e + 4); }
+        else if (id == 0x1e) { c.l1ssOff = (uint16_t)e; c.l1ss1 = d->extendedConfigRead32(e + 8); c.l1ss2 = d->extendedConfigRead32(e + 0xc); }
+        e = h >> 20;
+    }
+    c.valid = true;
+}
+static void cfgFix16(IOPCIDevice *d, UInt8 at, uint16_t want) { if (d->configRead16(at) != want) { d->configWrite16(at, want); gPs.cfgFixes++; } }
+static void cfgFix32(IOPCIDevice *d, UInt8 at, uint32_t want) { if (d->configRead32(at) != want) { d->configWrite32(at, want); gPs.cfgFixes++; } }
+static void cfgFixX(IOPCIDevice *d, UInt32 at, uint32_t want) { if (d->extendedConfigRead32(at) != want) { d->extendedConfigWrite32(at, want); gPs.cfgFixes++; } }
+static void cfgRestore(IOPCIDevice *d)
+{
+    const CfgSave &c = gCfg;
+    if (!c.valid) return;
+    if (c.pcie) {
+        cfgFix16(d, (UInt8)(c.pcie + 0x08), c.devCtl); cfgFix16(d, (UInt8)(c.pcie + 0x28), c.devCtl2);
+        cfgFix16(d, (UInt8)(c.pcie + 0x30), c.lnkCtl2); cfgFix16(d, (UInt8)(c.pcie + 0x10), c.lnkCtl);
+    }
+    if (c.ltrOff) cfgFixX(d, c.ltrOff + 4u, c.ltr);
+    if (c.l1ssOff) { cfgFixX(d, c.l1ssOff + 0xcu, c.l1ss2); cfgFixX(d, c.l1ssOff + 8u, c.l1ss1); }
+    bool rbDiff = false;
+    for (unsigned i = 0; i < c.rbN; i++) if ((d->extendedConfigRead32(c.rbOff[i]) & 0x3f00) != (c.rbCtl[i] & 0x3f00)) rbDiff = true;
+    if (rbDiff) {                                 // resize only with memory decode off; the BARs are rewritten below
+        d->configWrite16(0x04, (uint16_t)(d->configRead16(0x04) & ~0x2));
+        for (unsigned i = 0; i < c.rbN; i++) cfgFixX(d, c.rbOff[i], c.rbCtl[i]);
+    }
+    for (int i = 15; i >= 2; i--) cfgFix32(d, (UInt8)(i * 4), c.hdr[i]);   // 0x3c .. 0x08 (BARs, cache line...), top down
+    cfgFix16(d, 0x04, (uint16_t)(c.hdr[1] & 0xffff));                                   // command last (decode, bus master)
+    if (c.msi) {
+        cfgFix32(d, (UInt8)(c.msi + 4), c.msiLo);
+        if (c.msi64) { cfgFix32(d, (UInt8)(c.msi + 8), c.msiHi); cfgFix16(d, (UInt8)(c.msi + 0xc), c.msiData); }
+        else cfgFix16(d, (UInt8)(c.msi + 8), c.msiData);
+        cfgFix16(d, (UInt8)(c.msi + 2), c.msiCtl);
+    }
+}
+// PMCSR power state 0..3; false when the function has no PM capability or does not take the state.
+static bool pmSetD(IOPCIDevice *d, unsigned st)
+{
+    if (!gPs.pmcsrOff) { UInt8 off = 0; if (!d->findPCICapability(0x01, &off) || !off) return false; gPs.pmcsrOff = off; }
+    const UInt8 at = (UInt8)(gPs.pmcsrOff + 4);
+    const uint16_t v = d->configRead16(at);
+    gPs.noSoftRst = (v & 0x8) != 0;
+    d->configWrite16(at, (uint16_t)((v & ~0x8003u) | (st & 3)));   // keep PME_En, do not clear PME_Status
+    IOSleep(kD3hotDelayMs);
+    gPs.pmcsrIn = d->configRead16(at);
+    return (gPs.pmcsrIn & 3) == (st & 3);
 }
 
 static uint64_t pmUs(uint64_t t0) { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns); return ns / 1000ull; }
@@ -169,6 +258,8 @@ static void pmWork(thread_call_param_t, thread_call_param_t)
             gPmState = kPmSuspended; gPs.entries++; gPs.failRun = 0;
             gPs.enterUsLast = us; if (us > gPs.enterUsMax) gPs.enterUsMax = us;
             gPs.offSince = mach_absolute_time();
+            // E3b: config space saved, then D3hot (the GPU's GC6 entry is done, nothing of RM touches it any more)
+            if (gIdlePci) { cfgSave(gIdlePci); if (pmSetD(gIdlePci, 3)) gPs.d3++; else gPs.d3Fail++; }
         } else {
             gPs.lastErr = (uint32_t)st;
             if (tryAgain) { gPs.tryAgain++; again = true; }
@@ -193,7 +284,14 @@ static NV_STATUS pmResumeSync(const char *why)
         NvBool tryAgain = NV_FALSE;
         const uint64_t t0 = mach_absolute_time();
         gPmOwner = current_thread();
-        st = rm_transition_dynamic_power(NULL, gPmNv, NV_FALSE, &tryAgain);
+        // E3b: D0 and the saved config back before RM's exit touches the GPU
+        bool gone = false;
+        if (gIdlePci) {
+            if (!pmSetD(gIdlePci, 0)) gPs.d0Fail++;
+            gone = gIdlePci->configRead16(0x00) != 0x10de;   // not on the bus: RM must not touch it
+            if (!gone) cfgRestore(gIdlePci);
+        }
+        st = gone ? NV_ERR_GPU_IS_LOST : rm_transition_dynamic_power(NULL, gPmNv, NV_FALSE, &tryAgain);
         gPmOwner = THREAD_NULL;
         us = pmUs(t0); did = true;
         absolutetime_to_nanoseconds(t0 - gPs.offSince, &off); off /= 1000ull;
@@ -247,16 +345,18 @@ static void nv_xnu_rtd3_publish(IORegistryEntry *where)
     const SInt32 stt = gPmState;
     uint64_t offNow = 0;
     if (stt == kPmSuspended) { absolutetime_to_nanoseconds(mach_absolute_time() - gPs.offSince, &offNow); offNow /= 1000ull; }
-    char b[600];
+    char b[800];
     snprintf(b, sizeof b, "state %s | usage %d | block %s | entries %u exits %u | fail enter %u exit %u tryAgain %u | "
              "enter ms last %llu.%03llu max %llu.%03llu | exit ms last %llu.%03llu max %llu.%03llu | GC6 s total %llu now %llu | "
-             "last exit by %s | skipped %u recursion %u underflow %u msiOff %u holds %u | lastErr 0x%x",
+             "last exit by %s | skipped %u recursion %u underflow %u msiOff %u holds %u | lastErr 0x%x | "
+             "D3hot %u fail %u D0fail %u pmcsr 0x%04x noSoftRst %s cfgFixes %u",
              stt == kPmActive ? "active" : stt == kPmSuspended ? "GC6" : "LOST", (int)gPmUsage, gPmBlock ? gPmBlockWhy : "no",
              gPs.entries, gPs.exits, gPs.enterFail, gPs.exitFail, gPs.tryAgain,
              gPs.enterUsLast / 1000, gPs.enterUsLast % 1000, gPs.enterUsMax / 1000, gPs.enterUsMax % 1000,
              gPs.exitUsLast / 1000, gPs.exitUsLast % 1000, gPs.exitUsMax / 1000, gPs.exitUsMax % 1000,
              (gPs.offUsTotal + offNow) / 1000000ull, offNow / 1000000ull, gPs.lastWhy ? gPs.lastWhy : "-",
-             gPs.skipped, gPs.recursion, gPs.underflow, gPs.msiOff, gPs.holds, gPs.lastErr);
+             gPs.skipped, gPs.recursion, gPs.underflow, gPs.msiOff, gPs.holds, gPs.lastErr,
+             gPs.d3, gPs.d3Fail, gPs.d0Fail, gPs.pmcsrIn, gPs.noSoftRst ? "yes" : "no", gPs.cfgFixes);
     where->setProperty("nvrm-rtd3", b);
     where->setProperty("NVRMRtd3", kOSBooleanTrue);
     where->setProperty("NVRMGC6", stt == kPmSuspended ? kOSBooleanTrue : kOSBooleanFalse);
@@ -290,6 +390,7 @@ extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where)
         n += snprintf(b + n, sizeof b - (size_t)n, " %c%+lld", (c[i] >> 62) == 2 ? 'f' : 'c', (long long)((intptr_t)a - (intptr_t)anchor));
     }
     where->setProperty("nvrm-dynpm-state", b);
+    nv_xnu_rtd3_publish(where);   // E3: the time in GC6 moves with the sampler's periodic refresh too
 }
 
 // Whether the utilization sample should be skipped. The sampler asks RM once a second; each RM API call takes a dynamic

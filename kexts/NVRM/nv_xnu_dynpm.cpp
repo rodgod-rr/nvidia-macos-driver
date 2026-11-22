@@ -118,7 +118,35 @@ struct {
     uint64_t enterUsLast, enterUsMax, exitUsLast, exitUsMax, offUsTotal, offSince;
     uint32_t lastErr; const char *lastWhy;
     uint32_t d3, d3Fail, d0Fail, cfgFixes; uint16_t pmcsrOff, pmcsrIn; bool noSoftRst;
+    uint32_t cuts, cutBusy, cutFail, cutNone, gonn, gonnFail; uint32_t goffMs, gonnMs, gonnMsMax; IOReturn lastCut;
 } gPs;
+bool gPmCut;                       // E3c: power removed by G15Fan (GOFF); a GONN is owed before anything touches the card
+}
+
+// ---- E3c: real power removal (Linux: platform _PR3 off after D3hot = D3cold) through G15Fan, kext to kext ------------
+// G15Fan's callPlatformFunction("G15RtxPower", op): 0 = stop the HDMI audio function (IOPM, its driver is not ours) and
+// GOFF (PG01._OFF); 1 = GONN (PG01._ON waits until the RTX answers on PCI) and audio back. No IOPM for the GPU itself.
+// Without G15Fan (or an old one) nothing is cut: GC6 + D3hot as in E3b. Boot-arg -nvrmrtd3nocut = E3b on purpose.
+// GONN runs inside pmResumeSync, so from nv_indicate_not_idle in RM's context: ACPI evaluation there is sleepable (RM
+// holds mutexes, no spinlock; the ACPI that froze in 17/11 was the JT _DSM before RM's init, not a power resource).
+static const OSSymbol *gPwrFn;
+static IOService *gPwrSvc;
+static bool pmCutWanted(void)
+{
+    static int no = -1;
+    if (no < 0) { char b[4]; no = PE_parse_boot_argn("-nvrmrtd3nocut", b, sizeof b) ? 1 : 0; }
+    return no == 0;
+}
+static IOService *pmPowerProvider(void)                  // looked up outside RM's context (suspend work), kept retained
+{
+    if (gPwrSvc) return gPwrSvc;
+    if (!gPwrFn) gPwrFn = OSSymbol::withCString("G15RtxPower");
+    OSDictionary *m = IOService::serviceMatching("G15Fan");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (IOService *sv = it ? OSDynamicCast(IOService, it->getNextObject()) : nullptr) { sv->retain(); gPwrSvc = sv; }
+    OSSafeReleaseNULL(it);
+    return gPwrSvc;
 }
 
 // ---- E3b: config space save/restore and D3hot around GC6 (Linux pci_pm_runtime_suspend/resume: pci_save_state,
@@ -260,6 +288,16 @@ static void pmWork(thread_call_param_t, thread_call_param_t)
             gPs.offSince = mach_absolute_time();
             // E3b: config space saved, then D3hot (the GPU's GC6 entry is done, nothing of RM touches it any more)
             if (gIdlePci) { cfgSave(gIdlePci); if (pmSetD(gIdlePci, 3)) gPs.d3++; else gPs.d3Fail++; }
+            // E3c: power off (only from D3hot, as Linux goes D3hot -> platform D3cold)
+            IOService *pw = (pmCutWanted() && gIdlePci && (gPs.pmcsrIn & 3) == 3) ? pmPowerProvider() : nullptr;
+            if (pw && gPwrFn) {
+                uint32_t ms = 0;
+                const IOReturn r = pw->callPlatformFunction(gPwrFn, true, (void *)(uintptr_t)0, &ms, nullptr, nullptr);
+                gPs.lastCut = r; gPs.goffMs = ms;
+                if (r == kIOReturnSuccess) { gPmCut = true; gPs.cuts++; }
+                else if (r == kIOReturnBusy) gPs.cutBusy++;      // HDMI audio would not stop: GC6 + D3hot only
+                else gPs.cutFail++;
+            } else if (pmCutWanted()) gPs.cutNone++;
         } else {
             gPs.lastErr = (uint32_t)st;
             if (tryAgain) { gPs.tryAgain++; again = true; }
@@ -286,6 +324,12 @@ static NV_STATUS pmResumeSync(const char *why)
         gPmOwner = current_thread();
         // E3b: D0 and the saved config back before RM's exit touches the GPU
         bool gone = false;
+        if (gPmCut && gPwrSvc && gPwrFn) {                 // E3c: power back first (synchronous: PGON waits for the link)
+            uint32_t ms = 0;
+            const IOReturn r = gPwrSvc->callPlatformFunction(gPwrFn, true, (void *)(uintptr_t)1, &ms, nullptr, nullptr);
+            gPs.gonnMs = ms; if (ms > gPs.gonnMsMax) gPs.gonnMsMax = ms;
+            if (r == kIOReturnSuccess) { gPmCut = false; gPs.gonn++; } else gPs.gonnFail++;
+        }
         if (gIdlePci) {
             if (!pmSetD(gIdlePci, 0)) gPs.d0Fail++;
             gone = gIdlePci->configRead16(0x00) != 0x10de;   // not on the bus: RM must not touch it
@@ -345,22 +389,26 @@ static void nv_xnu_rtd3_publish(IORegistryEntry *where)
     const SInt32 stt = gPmState;
     uint64_t offNow = 0;
     if (stt == kPmSuspended) { absolutetime_to_nanoseconds(mach_absolute_time() - gPs.offSince, &offNow); offNow /= 1000ull; }
-    char b[800];
+    char b[1000];
     snprintf(b, sizeof b, "state %s | usage %d | block %s | entries %u exits %u | fail enter %u exit %u tryAgain %u | "
              "enter ms last %llu.%03llu max %llu.%03llu | exit ms last %llu.%03llu max %llu.%03llu | GC6 s total %llu now %llu | "
              "last exit by %s | skipped %u recursion %u underflow %u msiOff %u holds %u | lastErr 0x%x | "
-             "D3hot %u fail %u D0fail %u pmcsr 0x%04x noSoftRst %s cfgFixes %u",
+             "D3hot %u fail %u D0fail %u pmcsr 0x%04x noSoftRst %s cfgFixes %u | cut %s: cuts %u busy %u fail %u none %u "
+             "GONN %u fail %u | GOFF ms %u GONN ms last %u max %u | lastCut 0x%x",
              stt == kPmActive ? "active" : stt == kPmSuspended ? "GC6" : "LOST", (int)gPmUsage, gPmBlock ? gPmBlockWhy : "no",
              gPs.entries, gPs.exits, gPs.enterFail, gPs.exitFail, gPs.tryAgain,
              gPs.enterUsLast / 1000, gPs.enterUsLast % 1000, gPs.enterUsMax / 1000, gPs.enterUsMax % 1000,
              gPs.exitUsLast / 1000, gPs.exitUsLast % 1000, gPs.exitUsMax / 1000, gPs.exitUsMax % 1000,
              (gPs.offUsTotal + offNow) / 1000000ull, offNow / 1000000ull, gPs.lastWhy ? gPs.lastWhy : "-",
              gPs.skipped, gPs.recursion, gPs.underflow, gPs.msiOff, gPs.holds, gPs.lastErr,
-             gPs.d3, gPs.d3Fail, gPs.d0Fail, gPs.pmcsrIn, gPs.noSoftRst ? "yes" : "no", gPs.cfgFixes);
+             gPs.d3, gPs.d3Fail, gPs.d0Fail, gPs.pmcsrIn, gPs.noSoftRst ? "yes" : "no", gPs.cfgFixes,
+             !pmCutWanted() ? "off (-nvrmrtd3nocut)" : gPmCut ? "POWER OFF" : "powered", gPs.cuts, gPs.cutBusy, gPs.cutFail,
+             gPs.cutNone, gPs.gonn, gPs.gonnFail, gPs.goffMs, gPs.gonnMs, gPs.gonnMsMax, (unsigned)gPs.lastCut);
     where->setProperty("nvrm-rtd3", b);
     where->setProperty("NVRMRtd3", kOSBooleanTrue);
     where->setProperty("NVRMGC6", stt == kPmSuspended ? kOSBooleanTrue : kOSBooleanFalse);
     where->setProperty("NVRMGC6Count", (unsigned long long)gPs.entries, 32);
+    where->setProperty("NVRMRtd3Cut", gPmCut ? kOSBooleanTrue : kOSBooleanFalse);
 }
 
 // Snapshot of RM's dynamic power bookkeeping (patch 620-g15-dynpm-debug.patch in dynamic-power.c), published on the

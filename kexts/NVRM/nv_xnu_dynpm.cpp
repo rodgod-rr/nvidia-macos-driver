@@ -4,41 +4,62 @@
  * nv_dynamic_power_available answers yes; the idle / not-idle / runtime-suspend callbacks only log and count for now, so
  * RM can arm its dynamic power state machine and we can see what it asks for. Nothing is suspended here yet.
  * Step E2 (21/11/2026): real revocation of user CPU mappings (nv_revoke_gpu_mappings & co., end of this file).
+ * Step E3 (22/11/2026): nvrmdynpm=2 executes RM's decision: runtime suspend into GC6 and a synchronous way back.
  */
 #include "nv-xnu.h"
 #include <IOKit/IOLib.h>
 #include <libkern/OSAtomic.h>
 #include <pexpert/pexpert.h>
+#include <kern/thread_call.h>
+#include <kern/sched_prim.h>
+#include <kern/clock.h>
 
+// nvrmdynpm=1: RM's dynamic power runs, revokes and decides idle, nothing is powered down (E1/E2).
+// nvrmdynpm=2: RM also executes the runtime suspend (GC6) from nv_indicate_idle, and the way back is synchronous (E3).
 static int nv_xnu_dynpm_cache = -1;
-extern "C" bool nv_xnu_dynpm_on(void)
+static int nv_xnu_dynpm_mode(void)
 {
-    if (nv_xnu_dynpm_cache < 0) { int v = 0; nv_xnu_dynpm_cache = (PE_parse_boot_argn("nvrmdynpm", &v, sizeof v) && v == 1) ? 1 : 0; }
-    return nv_xnu_dynpm_cache == 1;
+    if (nv_xnu_dynpm_cache < 0) {
+        int v = 0;
+        nv_xnu_dynpm_cache = (PE_parse_boot_argn("nvrmdynpm", &v, sizeof v) && (v == 1 || v == 2)) ? v : 0;
+    }
+    return nv_xnu_dynpm_cache;
 }
+extern "C" bool nv_xnu_dynpm_on(void) { return nv_xnu_dynpm_mode() >= 1; }
+extern "C" bool nv_xnu_dynpm_exec(void) { return nv_xnu_dynpm_mode() == 2; }
 static volatile SInt32 nIdle, nNotIdle, nAllow, nDisallow, nHoldoff, nMmap;
 #define DYNPM_LOG(cnt, what) do { SInt32 c = OSIncrementAtomic(&cnt) + 1; if (c <= 20 || (c % 100) == 0) \
     { kprintf("NVRM-xnu: dynpm: %s (#%d)\n", what, (int)c); IOLog("NVRM-xnu: dynpm: %s (#%d)\n", what, (int)c); } } while (0)
 
 static IOLock *rvLock(void);
-NvBool NV_API_CALL nv_dynamic_power_available(nv_state_t *) { if (nv_xnu_dynpm_on()) rvLock(); return nv_xnu_dynpm_on() ? NV_TRUE : NV_FALSE; }
-void NV_API_CALL nv_allow_runtime_suspend(nv_state_t *) { DYNPM_LOG(nAllow, "RM allows runtime suspend"); }
-void NV_API_CALL nv_disallow_runtime_suspend(nv_state_t *) { DYNPM_LOG(nDisallow, "RM disallows runtime suspend"); }
+static void pmInit(nv_state_t *nv);
+static void pmGet(void);
+static void pmPut(void);
+static NV_STATUS pmResumeSync(const char *why);
+NvBool NV_API_CALL nv_dynamic_power_available(nv_state_t *nv)
+{
+    if (!nv_xnu_dynpm_on()) return NV_FALSE;
+    rvLock();
+    pmInit(nv);
+    return NV_TRUE;
+}
+void NV_API_CALL nv_allow_runtime_suspend(nv_state_t *) { DYNPM_LOG(nAllow, "RM allows runtime suspend"); pmPut(); }
+void NV_API_CALL nv_disallow_runtime_suspend(nv_state_t *) { DYNPM_LOG(nDisallow, "RM disallows runtime suspend"); pmGet(); }
 // G15: RM's idle decision is published on the RTX PCI entry as NVRMIdle (Yes/No) and NVRMIdleCount, from a thread
-// call (the callers hold RM's dynamic power mutex, so no registry work in their context). Nothing is powered down here:
-// G15.app parks the RTX through G15Fan RtxPm (revoke + suspend + GOFF) after NVRMIdle stays Yes long enough, and the
-// G15PM wake hooks bring it back before a client reaches RM. A real GC6 runtime suspend is the next step (docs/RTX-GC6.md).
-#include <kern/thread_call.h>
+// call (the callers hold RM's dynamic power mutex, so no registry work in their context). With nvrmdynpm=1 nothing is
+// powered down here. With nvrmdynpm=2 (step E3) the runtime suspend below executes RM's decision (GC6).
 static volatile SInt32 gRmIdle;
 static IOPCIDevice *gIdlePci;
 static thread_call_t gIdleCall;
 static void nv_xnu_rv_publish(IORegistryEntry *where);
+static void nv_xnu_rtd3_publish(IORegistryEntry *where);
 static void nv_xnu_idle_publish(thread_call_param_t, thread_call_param_t)
 {
     if (!gIdlePci) return;
     gIdlePci->setProperty("NVRMIdle", gRmIdle ? kOSBooleanTrue : kOSBooleanFalse);
     gIdlePci->setProperty("NVRMIdleCount", (unsigned long long)nIdle, 32);
     nv_xnu_rv_publish(gIdlePci);
+    nv_xnu_rtd3_publish(gIdlePci);
 }
 static void nv_xnu_idle_note(nv_state_t *nv, bool idle)
 {
@@ -47,9 +68,200 @@ static void nv_xnu_idle_note(nv_state_t *nv, bool idle)
     if (!gIdleCall) gIdleCall = thread_call_allocate(nv_xnu_idle_publish, nullptr);
     if (gIdleCall) thread_call_enter(gIdleCall);
 }
-NV_STATUS NV_API_CALL nv_indicate_idle(nv_state_t *nv) { DYNPM_LOG(nIdle, "RM indicates IDLE"); nv_xnu_idle_note(nv, true); return NV_OK; }
-NV_STATUS NV_API_CALL nv_indicate_not_idle(nv_state_t *nv) { DYNPM_LOG(nNotIdle, "RM indicates NOT idle"); nv_xnu_idle_note(nv, false); return NV_OK; }
-void NV_API_CALL nv_idle_holdoff(nv_state_t *) { DYNPM_LOG(nHoldoff, "RM idle holdoff"); }
+// Linux: nv_indicate_idle = pm_runtime_put_noidle + a sysfs read that runs the PM core's idle check (autosuspend 500 ms
+// later: nv_pmops_runtime_suspend -> rm_transition_dynamic_power(enter)). nv_indicate_not_idle = pm_runtime_get_noresume
+// + pci_bus_type.shutdown, whose pci_device_shutdown does pm_runtime_resume(): the GPU is back, synchronously, before RM
+// goes on. Both are called with RM's dynamic power mutex held (and, from rmapiPrologue, the API lock).
+NV_STATUS NV_API_CALL nv_indicate_idle(nv_state_t *nv) { DYNPM_LOG(nIdle, "RM indicates IDLE"); nv_xnu_idle_note(nv, true); pmPut(); return NV_OK; }
+NV_STATUS NV_API_CALL nv_indicate_not_idle(nv_state_t *nv)
+{
+    DYNPM_LOG(nNotIdle, "RM indicates NOT idle");
+    nv_xnu_idle_note(nv, false);
+    pmGet();
+    return pmResumeSync("RM");
+}
+void NV_API_CALL nv_idle_holdoff(nv_state_t *) { DYNPM_LOG(nHoldoff, "RM idle holdoff"); pmGet(); }
+
+// ---- Runtime suspend executed for RM (step E3, nvrmdynpm=2; docs/RTX-GC6.md) ---------------------------------------
+// The Linux runtime PM pieces RM relies on, rebuilt here:
+// - usage count (dev->power.usage_count): starts at 2 (pci_pm_init's forbid + the probe reference), RM's
+//   nv_allow_runtime_suspend drops one, nv_indicate_idle drops one, nv_indicate_not_idle / nv_idle_holdoff /
+//   nv_disallow_runtime_suspend add one; our own holders (headWatch's BAR0 reads, the revoke watchdog) add one each.
+//   Zero = RM indicated idle with no holdoff: the suspend work runs kPmAutosuspendMs later (Linux autosuspend delay).
+// - suspend work (rpm_suspend): under gPmLock, rechecks the count, rm_transition_dynamic_power(enter) (GC6: RM takes the
+//   GPU locks itself; rmapiEnterRtd3PmPath makes its own API calls skip the dynamic power refcount). E3a stops there:
+//   no D3, no power cut, so the PCI link and config space stay as they are.
+// - resume (rpm_resume): under gPmLock, rm_transition_dynamic_power(exit) only. It runs in the caller's context: from
+//   nv_indicate_not_idle that is RM's, with the dynamic power mutex (and maybe the API lock) held, exactly as Linux's
+//   pm_runtime_resume runs inside nv_indicate_not_idle; RM's exit takes only the GPU locks.
+// Lock order: RM API lock -> RM dynamic power mutex -> gPmLock -> RM GPU locks (inside rm_transition_dynamic_power).
+// gMmapLock is never held while taking gPmLock (the revoke watchdog drops it first) and nothing under gPmLock takes
+// gMmapLock. nv_idle_holdoff, which RM calls from inside the exit (RmTransitionDynamicPower), only touches the atomic
+// count, never gPmLock. A resume asked for by the thread that is inside a transition (RM calling back) is counted and
+// answered OK instead of deadlocking on gPmLock.
+// Nothing else may touch the card while it is in GC6: the MSI handler skips rm_isr, the headWatch BAR0 reader holds a
+// usage reference while it runs, the utilization sampler asks RM only after RM saw calls, and system sleep / shutdown
+// block new suspends and bring the GPU back first (nv_xnu_dynpm_block).
+namespace {
+enum { kPmActive = 0, kPmSuspended = 1, kPmLost = 2 };
+const uint32_t kPmAutosuspendMs = 500, kPmRetryMs = 1000, kPmMaxFailRun = 5;
+IOLock *gPmLock;
+volatile SInt32 gPmUsage = 2;
+volatile SInt32 gPmState = kPmActive;
+volatile SInt32 gPmBlock;          // system sleep, shutdown, repeated failures, lost GPU: no new suspend
+const char *gPmBlockWhy = "";
+thread_call_t gPmCall;
+nv_state_t *gPmNv;
+thread_t gPmOwner;                 // thread inside rm_transition_dynamic_power
+struct {
+    uint32_t entries, exits, enterFail, exitFail, tryAgain, skipped, recursion, failRun, underflow, msiOff, holds;
+    uint64_t enterUsLast, enterUsMax, exitUsLast, exitUsMax, offUsTotal, offSince;
+    uint32_t lastErr; const char *lastWhy;
+} gPs;
+}
+
+static uint64_t pmUs(uint64_t t0) { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns); return ns / 1000ull; }
+static void pmWork(thread_call_param_t, thread_call_param_t);
+static void pmInit(nv_state_t *nv)
+{
+    if (!nv_xnu_dynpm_exec()) return;
+    if (nv && !gPmNv) gPmNv = nv;
+    if (!gIdlePci && nv && nv->handle) gIdlePci = ((nv_xnu_pci_slot *)nv->handle)->pci;
+    if (!gPmLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void * volatile *)&gPmLock)) IOLockFree(l); }
+    if (!gPmCall) { thread_call_t c = thread_call_allocate(pmWork, nullptr); if (c && !OSCompareAndSwapPtr(nullptr, c, (void * volatile *)&gPmCall)) thread_call_free(c); }
+}
+static void pmPublishSoon(void)
+{
+    if (!gIdleCall) gIdleCall = thread_call_allocate(nv_xnu_idle_publish, nullptr);
+    if (gIdleCall && gIdlePci) thread_call_enter(gIdleCall);
+}
+static void pmSchedule(uint32_t ms)
+{
+    if (!nv_xnu_dynpm_exec() || !gPmCall || gPmBlock || OSAddAtomic(0, &gPmUsage) != 0) return;
+    uint64_t dl; clock_interval_to_deadline(ms, kMillisecondScale, &dl);
+    thread_call_enter_delayed(gPmCall, dl);
+}
+static void pmGet(void) { if (nv_xnu_dynpm_exec()) OSIncrementAtomic(&gPmUsage); }
+static void pmPut(void)
+{
+    if (!nv_xnu_dynpm_exec()) return;
+    for (;;) {                                         // pm_runtime_put_noidle: never below 0
+        SInt32 u = gPmUsage;
+        if (u <= 0) { gPs.underflow++; return; }
+        if (OSCompareAndSwap((UInt32)u, (UInt32)(u - 1), (volatile UInt32 *)&gPmUsage)) { if (u == 1) pmSchedule(kPmAutosuspendMs); return; }
+    }
+}
+// Suspend work (thread call): RM indicated idle and nothing holds the GPU.
+static void pmWork(thread_call_param_t, thread_call_param_t)
+{
+    if (!gPmLock) return;
+    bool again = false; NV_STATUS st = NV_OK; uint64_t us = 0; bool did = false;
+    IOLockLock(gPmLock);
+    if (OSAddAtomic(0, &gPmUsage) != 0 || gPmBlock || gPmState != kPmActive || !gPmNv) gPs.skipped++;
+    else {
+        NvBool tryAgain = NV_FALSE;
+        const uint64_t t0 = mach_absolute_time();
+        gPmOwner = current_thread();
+        st = rm_transition_dynamic_power(NULL, gPmNv, NV_TRUE, &tryAgain);
+        gPmOwner = THREAD_NULL;
+        us = pmUs(t0); did = true;
+        if (st == NV_OK) {
+            gPmState = kPmSuspended; gPs.entries++; gPs.failRun = 0;
+            gPs.enterUsLast = us; if (us > gPs.enterUsMax) gPs.enterUsMax = us;
+            gPs.offSince = mach_absolute_time();
+        } else {
+            gPs.lastErr = (uint32_t)st;
+            if (tryAgain) { gPs.tryAgain++; again = true; }
+            else if (++gPs.enterFail, ++gPs.failRun >= kPmMaxFailRun) { gPmBlock = 1; gPmBlockWhy = "entry failed repeatedly"; }
+        }
+    }
+    IOLockUnlock(gPmLock);
+    if (did && (gPs.entries + gPs.enterFail <= 50 || (gPs.entries % 100) == 0 || st != NV_OK))
+        IOLog("NVRM-xnu: rtd3: GC6 entry %s (0x%x) in %llu.%03llu ms (entries %u, failures %u%s)\n", st == NV_OK ? "done" : "FAILED",
+              (unsigned)st, us / 1000, us % 1000, gPs.entries, gPs.enterFail, again ? ", RM asks to try again" : gPmBlock ? ", suspend now blocked" : "");
+    if (again) pmSchedule(kPmRetryMs);
+    if (did) pmPublishSoon();
+}
+// rpm_resume: the GPU is at full power when this returns NV_OK.
+static NV_STATUS pmResumeSync(const char *why)
+{
+    if (!nv_xnu_dynpm_exec() || !gPmLock) return NV_OK;
+    if (gPmOwner == current_thread()) { gPs.recursion++; return NV_OK; }
+    NV_STATUS st = NV_OK; uint64_t us = 0, off = 0; bool did = false;
+    IOLockLock(gPmLock);
+    if (gPmState == kPmSuspended && gPmNv) {
+        NvBool tryAgain = NV_FALSE;
+        const uint64_t t0 = mach_absolute_time();
+        gPmOwner = current_thread();
+        st = rm_transition_dynamic_power(NULL, gPmNv, NV_FALSE, &tryAgain);
+        gPmOwner = THREAD_NULL;
+        us = pmUs(t0); did = true;
+        absolutetime_to_nanoseconds(t0 - gPs.offSince, &off); off /= 1000ull;
+        gPs.offUsTotal += off; gPs.lastWhy = why;
+        if (st == NV_OK) { gPmState = kPmActive; gPs.exits++; gPs.exitUsLast = us; if (us > gPs.exitUsMax) gPs.exitUsMax = us; }
+        else { gPmState = kPmLost; gPs.exitFail++; gPs.lastErr = (uint32_t)st; gPmBlock = 1; gPmBlockWhy = "exit failed (GPU lost)"; }
+    } else if (gPmState == kPmLost) st = NV_ERR_GPU_IS_LOST;
+    IOLockUnlock(gPmLock);
+    if (did && (gPs.exits + gPs.exitFail <= 50 || (gPs.exits % 100) == 0 || st != NV_OK))
+        IOLog("NVRM-xnu: rtd3: GC6 exit for %s %s (0x%x) in %llu.%03llu ms after %llu ms in GC6 (exits %u)\n", why,
+              st == NV_OK ? "done" : "FAILED", (unsigned)st, us / 1000, us % 1000, off / 1000, gPs.exits);
+    if (did) pmPublishSoon();
+    return st;
+}
+
+// True while the card must not be touched outside RM (GC6 or lost). Lock-free read for the MSI handler.
+extern "C" bool nv_xnu_dynpm_gpu_off(void)
+{
+    if (!nv_xnu_dynpm_exec() || gPmState == kPmActive) return false;
+    OSIncrementAtomic((volatile SInt32 *)&gPs.msiOff);
+    return true;
+}
+extern "C" bool nv_xnu_dynpm_gpu_off_quiet(void) { return nv_xnu_dynpm_exec() && gPmState != kPmActive; }
+// A kernel reader of the card's registers outside RM (headWatch): hold = usage reference + GPU back if suspended.
+extern "C" void nv_xnu_dynpm_hold(bool on, const char *why)
+{
+    if (!nv_xnu_dynpm_exec()) return;
+    if (on) { pmGet(); gPs.holds++; pmResumeSync(why); } else pmPut();
+}
+// System sleep / shutdown / unload: no new suspend, GPU back now (outside RM's dynamic power mutex, as the PCI core's
+// pm_runtime_resume before system suspend on Linux; RM's state may still say idle-indicated, its next reference then
+// finds the GPU active). Unblocked after a good wake.
+extern "C" void nv_xnu_dynpm_block(bool on, const char *why)
+{
+    if (!nv_xnu_dynpm_exec() || !gPmLock) return;
+    if (on) {
+        IOLockLock(gPmLock); gPmBlock = 1; gPmBlockWhy = why; IOLockUnlock(gPmLock);
+        if (gPmCall) thread_call_cancel_wait(gPmCall);
+        pmResumeSync(why);
+    } else {
+        IOLockLock(gPmLock);
+        if (gPmState == kPmActive) { gPmBlock = 0; gPmBlockWhy = ""; gPs.failRun = 0; }
+        IOLockUnlock(gPmLock);
+        pmSchedule(kPmAutosuspendMs);
+    }
+    pmPublishSoon();
+}
+static void nv_xnu_rtd3_publish(IORegistryEntry *where)
+{
+    if (!nv_xnu_dynpm_exec() || !where) return;
+    const SInt32 stt = gPmState;
+    uint64_t offNow = 0;
+    if (stt == kPmSuspended) { absolutetime_to_nanoseconds(mach_absolute_time() - gPs.offSince, &offNow); offNow /= 1000ull; }
+    char b[600];
+    snprintf(b, sizeof b, "state %s | usage %d | block %s | entries %u exits %u | fail enter %u exit %u tryAgain %u | "
+             "enter ms last %llu.%03llu max %llu.%03llu | exit ms last %llu.%03llu max %llu.%03llu | GC6 s total %llu now %llu | "
+             "last exit by %s | skipped %u recursion %u underflow %u msiOff %u holds %u | lastErr 0x%x",
+             stt == kPmActive ? "active" : stt == kPmSuspended ? "GC6" : "LOST", (int)gPmUsage, gPmBlock ? gPmBlockWhy : "no",
+             gPs.entries, gPs.exits, gPs.enterFail, gPs.exitFail, gPs.tryAgain,
+             gPs.enterUsLast / 1000, gPs.enterUsLast % 1000, gPs.enterUsMax / 1000, gPs.enterUsMax % 1000,
+             gPs.exitUsLast / 1000, gPs.exitUsLast % 1000, gPs.exitUsMax / 1000, gPs.exitUsMax % 1000,
+             (gPs.offUsTotal + offNow) / 1000000ull, offNow / 1000000ull, gPs.lastWhy ? gPs.lastWhy : "-",
+             gPs.skipped, gPs.recursion, gPs.underflow, gPs.msiOff, gPs.holds, gPs.lastErr);
+    where->setProperty("nvrm-rtd3", b);
+    where->setProperty("NVRMRtd3", kOSBooleanTrue);
+    where->setProperty("NVRMGC6", stt == kPmSuspended ? kOSBooleanTrue : kOSBooleanFalse);
+    where->setProperty("NVRMGC6Count", (unsigned long long)gPs.entries, 32);
+}
 
 // Snapshot of RM's dynamic power bookkeeping (patch 620-g15-dynpm-debug.patch in dynamic-power.c), published on the
 // RTX PCI entry as nvrm-dynpm-state: what keeps the refcount above 0 so RM never indicates idle. Callers are offsets
@@ -80,15 +292,28 @@ extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where)
     where->setProperty("nvrm-dynpm-state", b);
 }
 
-// True while RM counts the GPU as idle (idle-instant / sustained / indicated). The utilization sampler asks RM once a
-// second; each RM API call takes a dynamic power reference and puts the state back to in-use, so RM never saw two idle
-// checks (5 s each) in a row and never indicated idle (like nvidia-smi polling on Linux). An idle GPU is at 0 %.
+// Whether the utilization sample should be skipped. The sampler asks RM once a second; each RM API call takes a dynamic
+// power reference and puts the state back to in-use, so RM never saw two idle checks (5 s each) in a row and never
+// indicated idle (like nvidia-smi polling on Linux). But in fine mode RM sits in idle-instant between calls even while
+// a game draws, so "skip while idle-instant or more" showed a game at 0 % (docs/RTX-GC6.md, 21/11 22:55). Skip only
+// when RM counts the GPU idle AND nobody referenced it since the end of the previous sample (refs c+f unchanged): a
+// working GPU is sampled, a quiet one is left alone, and a GPU in GC6 is never woken by the sampler.
+static volatile uint32_t gSampleRefs; static volatile bool gSampleRefsOk;
 extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv)
 {
     if (!nv_xnu_dynpm_on() || !nv) return false;
     NvU32 v[22] = {};
     rm_xnu_dynamic_power_snapshot(nv, v, NULL);
-    return v[0] == 2 /* fine */ && v[1] >= 2 /* idle-instant, idle-sustained, idle-indicated */;
+    const bool idle = v[0] == 2 /* fine */ && v[1] >= 2 /* idle-instant, idle-sustained, idle-indicated */;
+    return idle && gSampleRefsOk && (uint32_t)(v[9] + v[10]) == gSampleRefs;
+}
+// After each real sample: the reference count the next skip decision compares with (the sample's own calls included).
+extern "C" void nv_xnu_dynpm_sample_done(nv_state_t *nv)
+{
+    if (!nv_xnu_dynpm_on() || !nv) return;
+    NvU32 v[22] = {};
+    rm_xnu_dynamic_power_snapshot(nv, v, NULL);
+    gSampleRefs = (uint32_t)(v[9] + v[10]); gSampleRefsOk = true;
 }
 
 // ---- Revocation of user CPU mappings of the GPU (step E2, 21/11/2026; docs/RTX-GC6.md) ----------------------------
@@ -115,13 +340,14 @@ extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv)
 // harmless. A fault while safe restores everything at once (like Linux's re-insert); a fault while not safe asks RM
 // for the GPU (rm_schedule_gpu_wakeup, once per idle period, as Linux's gpu_wakeup_callback_needed), and RM's
 // nv_set_safe_to_mmap_locked(TRUE) restores everything (thread call: no IOKit work inside RM's locks).
-// Watchdog: a fault not served in kRvWatchdogMs is restored anyway (nothing is powered off before step E3, so the
-// pages are valid; logged and counted). Gate: nvrmdynpm=1. With 0 nothing here runs and clientMemoryForType is as before.
+// Watchdog: a fault not served in kRvWatchdogMs is restored anyway (logged and counted). With nvrmdynpm=1 nothing is
+// powered off, so the pages are valid. With nvrmdynpm=2 the card may be in GC6: the watchdog first brings it back
+// (usage reference + synchronous resume, gMmapLock dropped), restores only if that worked, and keeps the reference
+// until RM says safe-to-mmap again (its own wakeup arrived). Gate: nvrmdynpm>=1. With 0 nothing here runs and
+// clientMemoryForType is as before.
 // Lock order: RM dynamic power mutex -> gMmapLock -> gIOMemoryLock. Nothing here calls RM with gMmapLock held.
 // Counters: nvrm-revoke on the RTX PCI entry.
 #include <IOKit/IOMemoryDescriptor.h>
-#include <kern/sched_prim.h>
-#include <kern/clock.h>
 
 namespace {
 struct RvEntry { IOMemoryDescriptor *md; bool redirected; bool multi; };
@@ -140,7 +366,9 @@ nv_state_t *gRvNv;
 IOLock *gMmapLock;
 thread_call_t gRvPollCall, gRvRestoreCall;
 volatile SInt32 gRvPollArmed;
-struct { uint32_t revokes, redirects, restores, faultsSafe, faultsWake, wakeReqs, wakeFail, watchdog, newBlocked, refused; uint64_t lastFaultPhys; } gRs;
+bool gRvDogHold;              // the watchdog holds a usage reference (nvrmdynpm=2) until RM sets safe again
+struct { uint32_t revokes, redirects, restores, faultsSafe, faultsWake, wakeReqs, wakeFail, watchdog, dogWakeFail, newBlocked, refused;
+         uint64_t lastFaultPhys, polls, pollNs; } gRs;
 }
 
 static IOLock *rvLock(void)
@@ -204,6 +432,7 @@ static void rvRestoreAllLocked(void)
 static void rvPollArmLocked(void)
 {
     if (!gRvRedirected || !gRvPollCall || !OSCompareAndSwap(0, 1, &gRvPollArmed)) return;
+    // cost while the card sleeps: polls / cpu us in nvrm-revoke (the KPI has no leeway variant; measured in E4)
     uint64_t dl; clock_interval_to_deadline(kRvPollMs, kMillisecondScale, &dl);
     thread_call_enter_delayed(gRvPollCall, dl);
 }
@@ -221,10 +450,12 @@ static void rvWakeGpu(nv_state_t *nv)
 
 static void rvPoll(thread_call_param_t, thread_call_param_t)
 {
-    bool wake = false, faulted = false, dog = false;
+    bool wake = false, faulted = false, dog = false, dogWake = false;
     nv_state_t *nv = nullptr;
+    const uint64_t pt0 = mach_absolute_time();
     IOLockLock(gMmapLock);
     gRvPollArmed = 0;
+    gRs.polls++;
     for (unsigned i = 0; i < gRvN; i++) {
         if (!gRv[i].redirected) continue;
         if (thread_wakeup_prim((event_t)gRv[i].md, TRUE, THREAD_AWAKENED) == KERN_SUCCESS) {
@@ -240,13 +471,26 @@ static void rvPoll(thread_call_param_t, thread_call_param_t)
     }
     if (gRvFaultSince && gRvRedirected) {
         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - gRvFaultSince, &ns);
-        if (ns > (uint64_t)kRvWatchdogMs * 1000000ull) { gRs.watchdog++; rvRestoreAllLocked(); dog = true; }
+        if (ns > (uint64_t)kRvWatchdogMs * 1000000ull) {
+            gRs.watchdog++; dog = true;
+            if (!nv_xnu_dynpm_exec()) rvRestoreAllLocked();
+            else if (!gRvDogHold) { gRvDogHold = true; dogWake = true; }   // power first, below, without gMmapLock
+            else rvRestoreAllLocked();                                      // already held awake by an earlier watchdog
+        }
     }
     rvPollArmLocked();
     IOLockUnlock(gMmapLock);
-    if (dog) IOLog("NVRM-xnu: dynpm: revoke WATCHDOG: a fault waited %u ms for RM, mappings restored (#%u)\n", kRvWatchdogMs, gRs.watchdog);
+    if (dogWake) {
+        nv_xnu_dynpm_hold(true, "revoke watchdog");                         // usage reference + synchronous GC6 exit
+        IOLockLock(gMmapLock);
+        if (!nv_xnu_dynpm_gpu_off_quiet()) rvRestoreAllLocked(); else gRs.dogWakeFail++;
+        IOLockUnlock(gMmapLock);
+    }
+    if (dog) IOLog("NVRM-xnu: dynpm: revoke WATCHDOG: a fault waited %u ms for RM, %s (#%u)\n", kRvWatchdogMs,
+                   dogWake ? "GPU brought back by the watchdog, mappings restored" : "mappings restored", gRs.watchdog);
     if (wake) rvWakeGpu(nv);
     if (faulted || dog) rvPublishSoon();
+    gRs.pollNs += pmUs(pt0) * 1000ull;
 }
 static void rvRestoreFn(thread_call_param_t, thread_call_param_t)
 {
@@ -321,17 +565,20 @@ void NV_API_CALL nv_set_safe_to_mmap_locked(nv_state_t *, NvBool safe)
     if (!nv_xnu_dynpm_on()) return;
     if (!safe && gRvSafe) gRvWakeNeeded = true;
     gRvSafe = safe ? true : false;
+    if (safe && gRvDogHold) { gRvDogHold = false; nv_xnu_dynpm_hold(false, "revoke watchdog"); }   // RM's wakeup arrived
     if (safe && gRvRedirected && gRvRestoreCall) thread_call_enter(gRvRestoreCall);
 }
 
 static void nv_xnu_rv_publish(IORegistryEntry *where)
 {
     if (!nv_xnu_dynpm_on() || !where) return;
-    char b[480];
+    char b[600];
     snprintf(b, sizeof b, "tracked %u | redirected %u | multi %u | overflow %u | safe %s | allRevoked %s | revokes %u refused %u "
-             "redirects %u restores %u | faults safe %u wake %u | wakeReq %u fail %u | watchdog %u | newBlocked %u | lastFault 0x%llx",
+             "redirects %u restores %u | faults safe %u wake %u | wakeReq %u fail %u | watchdog %u dogWakeFail %u | newBlocked %u | "
+             "lastFault 0x%llx | polls %llu cpu us %llu",
              gRvN, gRvRedirected, gRvMulti, gRvOverflow, gRvSafe ? "yes" : "NO", gRvAllRevoked ? "yes" : "no", gRs.revokes,
              gRs.refused, gRs.redirects, gRs.restores, gRs.faultsSafe, gRs.faultsWake, gRs.wakeReqs, gRs.wakeFail,
-             gRs.watchdog, gRs.newBlocked, (unsigned long long)gRs.lastFaultPhys);
+             gRs.watchdog, gRs.dogWakeFail, gRs.newBlocked, (unsigned long long)gRs.lastFaultPhys,
+             (unsigned long long)gRs.polls, (unsigned long long)(gRs.pollNs / 1000ull));
     where->setProperty("nvrm-revoke", b);
 }

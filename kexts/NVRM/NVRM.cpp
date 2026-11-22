@@ -2640,6 +2640,9 @@ void NVRMUserClient::free(void)
 #include "nvrm_tok_table.h"
 static const uint32_t kNvMapTokenBit = 0x80000000u;
 static const unsigned kNvMapTokensPerClient = 4096;
+// G15 fork (nv_xnu_dynpm.cpp, nvrmdynpm=1): physical descriptors of card memory are registered for revocation before
+// RM indicates idle (Linux nv_revoke_gpu_mappings). No-op without nvrmdynpm=1.
+extern "C" void nv_xnu_rv_track(IOMemoryDescriptor *md, bool multi);
 IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
     Gate g(fGate);
@@ -2680,6 +2683,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
     struct FreeRanges { MemoryRange *p; ~FreeRanges() { if (p) kern_os_free(p); } } freeRanges = { ranges };
     nv_alloc_mapping_context_t *c = &snapshot;
     IOMemoryDescriptor *md = NULL;
+    bool rvDev = false, rvMulti = false;   // card memory (BAR) descriptor: revocable; multi-range: cannot be blocked
     NvU32 caching = c->caching;
     if (fIsCtl) {
         NvU64 bytes = 0; NvU32 cache = 0;
@@ -2715,6 +2719,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
             if (!md) return kIOReturnNotPermitted;
         } else if (n == 1) {
             md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)c->memArea.pRanges[0].start, (IOByteCount)c->memArea.pRanges[0].size, kIODirectionInOut);
+            rvDev = true;
         } else {
             for (NvU64 i = 0; i < n; i++) if (!nv_pm_is_gpu(c->memArea.pRanges[i].start, c->memArea.pRanges[i].size)) {
                 nv_pm_dev_refused(c->memArea.pRanges[i].start, c->memArea.pRanges[i].size); return kIOReturnNotPermitted; }
@@ -2723,6 +2728,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
             for (NvU64 i = 0; i < n; i++) { r[i].address = c->memArea.pRanges[i].start; r[i].length = c->memArea.pRanges[i].size; }
             md = IOMemoryDescriptor::withOptions(r, (UInt32)n, 0, NULL, kIOMemoryTypePhysical64 | kIODirectionInOut);
             kern_os_free(r);
+            rvDev = true; rvMulti = true;
         }
         kprintf("NVRM-xnu: map fd %d: device %llu range(s) first 0x%llx+0x%llx caching %u\n", fFd, n, c->memArea.pRanges[0].start, c->memArea.pRanges[0].size, caching);
     }
@@ -2759,6 +2765,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
         IOLockUnlock(fMapLock);
         if (r != kIOReturnSuccess) { md->release(); return r; }
     }
+    if (rvDev) nv_xnu_rv_track(md, rvMulti);
     *options |= add;
     *memory = md;
     return kIOReturnSuccess;

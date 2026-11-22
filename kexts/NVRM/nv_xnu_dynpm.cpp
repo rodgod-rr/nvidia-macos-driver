@@ -231,7 +231,7 @@ extern "C" void nv_xnu_dynpm_block(bool on, const char *why)
     if (!nv_xnu_dynpm_exec() || !gPmLock) return;
     if (on) {
         IOLockLock(gPmLock); gPmBlock = 1; gPmBlockWhy = why; IOLockUnlock(gPmLock);
-        if (gPmCall) thread_call_cancel_wait(gPmCall);
+        if (gPmCall) thread_call_cancel(gPmCall);   // a running pmWork sees gPmBlock under gPmLock (cancel_wait is not exported to kexts)
         pmResumeSync(why);
     } else {
         IOLockLock(gPmLock);

@@ -40,6 +40,8 @@ struct NVAGDCGPUCapability {
 static_assert(sizeof(NVAGDCVendorInfo) == 0x2c, "AGDCVendorInfo_t is 0x2c");
 static_assert(sizeof(NVAGDCGPUCapability) == 0xdc, "AGDCGPUCapability_t is 0xdc");
 
+static const char *gAgdcFBClass = "NVRMNVDAFramebuffer";   /* b84: or NMXGPUFB, see nvdaAgdcPickClass */
+static bool gAgdcIntel = false;
 static int    gAgdcK5 = 0;
 static SInt64 gAgdcK5Link = 0, gAgdcK5Caps = 0;
 static int    gAgdcK5Why = 0;
@@ -131,7 +133,9 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
     if (cmd == 1) {
         if (!out || !outSize || *outSize != sizeof(NVAGDCVendorInfo)) return kIOReturnBadArgument;
         NVAGDCVendorInfo *v = (NVAGDCVendorInfo *)out; bzero(v, sizeof *v);
-        v->version = 0x30000; strlcpy(v->vendor, "NVIDIA", sizeof v->vendor); v->vendorID = 0x10de; v->vendorClass = 2;
+        v->version = 0x30000;
+        if (gAgdcIntel) { strlcpy(v->vendor, "Intel", sizeof v->vendor); v->vendorID = 0x8086; v->vendorClass = 1; }
+        else { strlcpy(v->vendor, "NVIDIA", sizeof v->vendor); v->vendorID = 0x10de; v->vendorClass = 2; }
         return kIOReturnSuccess;
     }
     if (cmd == 0x980) {
@@ -169,6 +173,19 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
     return kIOReturnUnsupported;
 }
 
+/* b84 (10-19): the same AGDC object for the Intel GPU NMXGPU drives. WindowServer on NMXAccel failed with "IOPresentment:
+   Unable to get AGDC information" and never sent a display-pipe frame (iop_ok 0). The framebuffer is NMXGPUFB there. */
+static void nvdaAgdcPickClass(void)
+{
+    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    IOService *f = m ? IOService::copyMatchingService(m) : nullptr; OSSafeReleaseNULL(m);
+    if (f) { f->release(); gAgdcFBClass = "NVRMNVDAFramebuffer"; gAgdcIntel = false; return; }
+    /* g15-intel: so com o boot-arg nmxws=1 (WindowServer na UHD pelo i915); sem ele, o AGDC segue so a NVIDIA, como no 3.0 */
+    { uint32_t ws = 0; if (!PE_parse_boot_argn("nmxws", &ws, sizeof ws) || !ws) return; }
+    m = IOService::serviceMatching("NMXGPUFB");
+    f = m ? IOService::copyMatchingService(m) : nullptr; OSSafeReleaseNULL(m);
+    if (f) { f->release(); gAgdcFBClass = "NMXGPUFB"; gAgdcIntel = true; FBLOG("AGDC: no NVIDIA framebuffer; using NMXGPUFB (Intel/AMD through NMXGPU)"); }
+}
 static int gAgdcState = 0; static NVDADeviceControl *gAgdc = nullptr; static thread_call_t gAgdcCall = nullptr; static int gAgdcWant = 0;
 static IOService *gAgdcFBRef = nullptr;
 static void nvdaAgdcDropTable(void)
@@ -182,7 +199,8 @@ static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgd
 static void nvdaAgdcTargets(IOService **pci, IOService **fb)
 {
     *pci = nullptr; *fb = nullptr;
-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer"); if (!m) return;
+    nvdaAgdcPickClass();
+    OSDictionary *m = IOService::serviceMatching(gAgdcFBClass); if (!m) return;
     IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
     IOService *p = f->getProvider(); int hops = 0;
     while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
@@ -196,7 +214,7 @@ static void nvdaAgdcScan(IOService *pci)
 {
     nvdaAgdcDropTable(); gAgdcScanLogged = 0;
     IOService *tab[kAgdcMaxFB] = {}; unsigned seen = 0, noidx = 0, range = 0, dup = 0, other = 0, hole = 0;
-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    OSDictionary *m = IOService::serviceMatching(gAgdcFBClass);
     OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr; OSSafeReleaseNULL(m);
     if (!it) { snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)"); FBLOG("AGDC: slot table %s", gAgdcFBMap); return; }
     OSObject *o;

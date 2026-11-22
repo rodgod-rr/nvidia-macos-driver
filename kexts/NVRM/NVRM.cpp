@@ -88,7 +88,7 @@ static bool nvrmMultiGpu(void)
 #include "nv_rtd3_policy.h"
 extern "C" bool nv_xnu_dynpm_on(void);
 extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where);   // nv_xnu_dynpm.cpp
-extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv);
+extern "C" int nv_xnu_dynpm_sample_skip(nv_state_t *nv);
 extern "C" void nv_xnu_dynpm_sample_done(nv_state_t *nv);
 extern "C" bool nv_xnu_dynpm_exec(void);                         // nvrmdynpm=2: RM's runtime suspend (GC6) executed
 extern "C" bool nv_xnu_dynpm_gpu_off(void);
@@ -2438,10 +2438,18 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         NVRMUtilization *sample = (NVRMUtilization *)p1;
         if (!sample || sample->version != NVRM_UTILIZATION_ABI_VERSION) return kIOReturnBadArgument;
         if (!fUtilizationLock || isInactive()) return kIOReturnNotReady;
-        // G15 fork: no sample while RM counts the GPU idle and nobody called it since the last sample (nvrmdynpm>=1)
-        if (fPassDone >= 2 && nv_xnu_dynpm_gpu_idle(&fNv)) {
-            static uint32_t skips; if ((++skips % 60) == 1) nv_xnu_dynpm_publish(&fNv, fPCI);
-            return kIOReturnNotReady;
+        // G15 fork (nvrmdynpm>=1): no RM call while RM counts the GPU idle and nothing touched it since the last sample
+        // (nv_xnu_dynpm.cpp). Skipped samples repeat the last measured value with a fresh timestamp (NVAccel drops a
+        // value older than 5 s, and doorbell-only work would then show as idle), or 0 % once RM indicated idle (GC6).
+        static NVRMUtilization lastUtil; static bool lastUtilOk; static uint32_t utilSkips;
+        if (const int skip = fPassDone >= 2 ? nv_xnu_dynpm_sample_skip(&fNv) : 0) {
+            if ((++utilSkips % 60) == 1) nv_xnu_dynpm_publish(&fNv, fPCI);
+            if (skip == 1 && !lastUtilOk) return kIOReturnNotReady;
+            const unsigned long long ts = (lastUtilOk ? lastUtil.timestamp : 0) + utilSkips;
+            if (skip == 2) { *sample = {}; sample->version = NVRM_UTILIZATION_ABI_VERSION; }
+            else *sample = lastUtil;
+            sample->timestamp = ts ? ts : 1;
+            return kIOReturnSuccess;
         }
         int counted = 0;
         if (!nv_xnu_pm_try_enter(&counted)) return kIOReturnNotReady;
@@ -2463,6 +2471,7 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         IOLockUnlock(fUtilizationLock);
         nv_xnu_pm_exit(counted);
         if (ready) { nv_xnu_dynpm_sample_done(&fNv); nv_xnu_dynpm_publish(&fNv, fPCI); }   // G15 fork: skip base + nvrm-dynpm-state
+        if (ok) { lastUtil = *sample; lastUtilOk = true; }
         return ok ? kIOReturnSuccess : (ready ? kIOReturnIOError : kIOReturnNotReady);
     }
     if (fn && fn->isEqualTo("NVRMBootRaster")) {

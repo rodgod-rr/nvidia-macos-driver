@@ -444,25 +444,39 @@ extern "C" void nv_xnu_dynpm_publish(nv_state_t *nv, IORegistryEntry *where)
 // Whether the utilization sample should be skipped. The sampler asks RM once a second; each RM API call takes a dynamic
 // power reference and puts the state back to in-use, so RM never saw two idle checks (5 s each) in a row and never
 // indicated idle (like nvidia-smi polling on Linux). But in fine mode RM sits in idle-instant between calls even while
-// a game draws, so "skip while idle-instant or more" showed a game at 0 % (docs/RTX-GC6.md, 21/11 22:55). Skip only
-// when RM counts the GPU idle AND nobody referenced it since the end of the previous sample (refs c+f unchanged): a
-// working GPU is sampled, a quiet one is left alone, and a GPU in GC6 is never woken by the sampler.
-static volatile uint32_t gSampleRefs; static volatile bool gSampleRefsOk;
-extern "C" bool nv_xnu_dynpm_gpu_idle(nv_state_t *nv)
+// a game draws, so "skip while idle-instant or more" showed a game at 0 % (docs/RTX-GC6.md, 21/11 22:55); and work
+// submitted only through the USERMODE doorbell (rtxstress, NVK) does not call RM at all, so "skip while RM's refs did
+// not move" still showed it at 0 % (E3c, 21/11 23:30). Skip only when ALL of these hold:
+//   - RM counts the GPU idle (fine mode, idle-instant or more);
+//   - nobody referenced RM since the end of the previous sample (refs c+f unchanged);
+//   - no revoked mapping was touched since then (faults unchanged: a doorbell write after a revoke is work);
+//   - RM already indicated idle (the card may be in GC6: never wake it for a number), or the previous real sample is
+//     less than kSampleEveryMs old. From a sample to RM's idle indication takes 5-10 s (two idle checks), so one
+//     sample every 12 s still lets a quiet GPU reach GC6, and doorbell-only work gets a reading every 12 s.
+static volatile uint32_t gSampleRefs, gSampleFaults; static volatile bool gSampleRefsOk; static volatile uint64_t gSampleAt;
+static const uint32_t kSampleEveryMs = 12000;
+static uint32_t rvFaultCount(void);
+// 0 = sample now; 1 = skip, answer with the last measured value (the GPU may still work through the doorbell; NVAccel
+// drops a value older than 5 s, shorter than RM's 5-10 s idle path); 2 = skip, RM indicated idle (in GC6 with
+// nvrmdynpm=2): answer 0 %.
+extern "C" int nv_xnu_dynpm_sample_skip(nv_state_t *nv)
 {
-    if (!nv_xnu_dynpm_on() || !nv) return false;
+    if (!nv_xnu_dynpm_on() || !nv) return 0;
     NvU32 v[22] = {};
     rm_xnu_dynamic_power_snapshot(nv, v, NULL);
     const bool idle = v[0] == 2 /* fine */ && v[1] >= 2 /* idle-instant, idle-sustained, idle-indicated */;
-    return idle && gSampleRefsOk && (uint32_t)(v[9] + v[10]) == gSampleRefs;
+    if (!idle || !gSampleRefsOk || (uint32_t)(v[9] + v[10]) != gSampleRefs || rvFaultCount() != gSampleFaults) return 0;
+    if (v[1] == 4 /* idle-indicated */) return 2;
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - gSampleAt, &ns);
+    return ns < (uint64_t)kSampleEveryMs * 1000000ull ? 1 : 0;
 }
-// After each real sample: the reference count the next skip decision compares with (the sample's own calls included).
+// After each real sample: what the next skip decision compares with (the sample's own calls included).
 extern "C" void nv_xnu_dynpm_sample_done(nv_state_t *nv)
 {
     if (!nv_xnu_dynpm_on() || !nv) return;
     NvU32 v[22] = {};
     rm_xnu_dynamic_power_snapshot(nv, v, NULL);
-    gSampleRefs = (uint32_t)(v[9] + v[10]); gSampleRefsOk = true;
+    gSampleRefs = (uint32_t)(v[9] + v[10]); gSampleFaults = rvFaultCount(); gSampleAt = mach_absolute_time(); gSampleRefsOk = true;
 }
 
 // ---- Revocation of user CPU mappings of the GPU (step E2, 21/11/2026; docs/RTX-GC6.md) ----------------------------
@@ -718,6 +732,7 @@ void NV_API_CALL nv_set_safe_to_mmap_locked(nv_state_t *, NvBool safe)
     if (safe && gRvRedirected && gRvRestoreCall) thread_call_enter(gRvRestoreCall);
 }
 
+static uint32_t rvFaultCount(void) { return gRs.faultsSafe + gRs.faultsWake + gRs.newBlocked; }
 static void nv_xnu_rv_publish(IORegistryEntry *where)
 {
     if (!nv_xnu_dynpm_on() || !where) return;

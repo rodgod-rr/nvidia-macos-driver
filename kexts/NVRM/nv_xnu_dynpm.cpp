@@ -518,7 +518,10 @@ extern "C" void nv_xnu_dynpm_sample_done(nv_state_t *nv)
 namespace {
 struct RvEntry { IOMemoryDescriptor *md; bool redirected; bool multi; };
 const unsigned kRvMax = 4096;
-const uint32_t kRvPollMs = 15, kRvWatchdogMs = 2000;
+// Poll period: 15 ms while the card is powered (revoked, GC6 not entered yet: a fault must not wait long); 100 ms while
+// it is in GC6 (E4: ~66 -> ~10 CPU wakeups/s for all the idle time; the way back already costs ~1.24 s with the power
+// cut, so the detection adds at most 0.1 s). The KPI has no thread call with leeway, so the count is what can shrink.
+const uint32_t kRvPollMs = 15, kRvPollOffMs = 100, kRvWatchdogMs = 2000;
 RvEntry gRv[kRvMax];
 unsigned gRvN;               // tracked descriptors (each retained once)
 unsigned gRvRedirected;      // tracked and redirected now
@@ -534,7 +537,7 @@ thread_call_t gRvPollCall, gRvRestoreCall;
 volatile SInt32 gRvPollArmed;
 bool gRvDogHold;              // the watchdog holds a usage reference (nvrmdynpm=2) until RM sets safe again
 struct { uint32_t revokes, redirects, restores, faultsSafe, faultsWake, wakeReqs, wakeFail, watchdog, dogWakeFail, newBlocked, refused;
-         uint64_t lastFaultPhys, polls, pollNs; } gRs;
+         uint64_t lastFaultPhys, polls, pollsOff, pollNs; } gRs;
 }
 
 static IOLock *rvLock(void)
@@ -598,8 +601,9 @@ static void rvRestoreAllLocked(void)
 static void rvPollArmLocked(void)
 {
     if (!gRvRedirected || !gRvPollCall || !OSCompareAndSwap(0, 1, &gRvPollArmed)) return;
-    // cost while the card sleeps: polls / cpu us in nvrm-revoke (the KPI has no leeway variant; measured in E4)
-    uint64_t dl; clock_interval_to_deadline(kRvPollMs, kMillisecondScale, &dl);
+    const bool off = nv_xnu_dynpm_gpu_off_quiet();       // GC6 (or lost): slow poll
+    if (off) gRs.pollsOff++;
+    uint64_t dl; clock_interval_to_deadline(off ? kRvPollOffMs : kRvPollMs, kMillisecondScale, &dl);
     thread_call_enter_delayed(gRvPollCall, dl);
 }
 static void rvWakeGpu(nv_state_t *nv)
@@ -742,10 +746,10 @@ static void nv_xnu_rv_publish(IORegistryEntry *where)
     char b[600];
     snprintf(b, sizeof b, "tracked %u | redirected %u | multi %u | overflow %u | safe %s | allRevoked %s | revokes %u refused %u "
              "redirects %u restores %u | faults safe %u wake %u | wakeReq %u fail %u | watchdog %u dogWakeFail %u | newBlocked %u | "
-             "lastFault 0x%llx | polls %llu cpu us %llu",
+             "lastFault 0x%llx | polls %llu (in GC6 %llu) cpu us %llu",
              gRvN, gRvRedirected, gRvMulti, gRvOverflow, gRvSafe ? "yes" : "NO", gRvAllRevoked ? "yes" : "no", gRs.revokes,
              gRs.refused, gRs.redirects, gRs.restores, gRs.faultsSafe, gRs.faultsWake, gRs.wakeReqs, gRs.wakeFail,
              gRs.watchdog, gRs.dogWakeFail, gRs.newBlocked, (unsigned long long)gRs.lastFaultPhys,
-             (unsigned long long)gRs.polls, (unsigned long long)(gRs.pollNs / 1000ull));
+             (unsigned long long)gRs.polls, (unsigned long long)gRs.pollsOff, (unsigned long long)(gRs.pollNs / 1000ull));
     where->setProperty("nvrm-revoke", b);
 }

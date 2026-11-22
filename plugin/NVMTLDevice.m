@@ -237,7 +237,8 @@ static nvk_queue *nvmtl_device_queue(void) {
 static bool nvmtl_accel_armed(void)
 {
     int v = 0; size_t n = sizeof v;
-    if (sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) != 0) return false;
+    /* g15-intel: no processo com o Metal na UHD, o arme e o do NMXAccel (debug.nmx_nvaccelfb) */
+    if (sysctlbyname(nvmtl_vk_vendor() == 0x10de ? "debug.nvaccelfb" : "debug.nmx_nvaccelfb", &v, &n, NULL, 0) != 0) return false;
     return v != 0;
 }
 #include <dlfcn.h>
@@ -747,6 +748,10 @@ static bool nvmtl_process_is_allowed(void)
     // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
     // WindowServer before its "!WindowServer" line is reached.
+    // g15-intel (nmxws do fork IrisXe): com o boot-arg nmxws=1 e o acelerador armado (debug.nvaccelfb=1), o WindowServer
+    // compoe na UHD pelo NMXAccel - a Intel e a dona da tela, nao uma GPU so de apps.
+    if (!strcmp(me, "WindowServer") && nvmtl_vk_vendor() == 0x8086 && nvmtl_accel_armed()) {
+        nvlog("  WindowServer on the Intel GPU: NMXAccel is armed (nmxws=1, debug.nvaccelfb=1)"); return true; }
     { int hv = 0; size_t hn = sizeof hv;
       if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
                                           (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {

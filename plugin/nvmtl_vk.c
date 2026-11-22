@@ -1088,6 +1088,7 @@ static void nvmtl_dlss_device_features(VkPhysicalDeviceVulkan11Features *v11, Vk
     nvlog("dlss: core 1.1/1.2 device features widened to what the device supports");
 }
 
+#include "nvmtl_drmbridge.h"   /* g15-intel: ponte DRM do fork IrisXe (zep245) */
 static int nvmtl_vk_initialize(void)
 {
     if (g_state) return g_state == 1 ? 0 : -1;
@@ -1123,7 +1124,37 @@ static int nvmtl_vk_initialize(void)
        though RADV compiles them. GCN 1/2 have no 16-bit ALU and keep shaderFloat16 off: their half modules stay refused,
        which is what keeps ACO from compiling half arithmetic it cannot lower there. A value the user set wins. */
     if (nvmtl_vk_vendor() == 0x1002) setenv("radv_enable_float16_gfx8", "true", 0);
+    /* b82: Mesa's anonymous files (ANV device creation) go to $XDG_RUNTIME_DIR, else /tmp/xdg-runtime-mesa-<uid>, which
+       it refuses when the owner is not the caller: WindowServer (uid 0, euid 88) failed vkCreateDevice with
+       "/tmp/xdg-runtime-mesa-0 exists but has wrong owner" (10-19). Point it at this process's own temp folder. */
+    /* b251: the folder is now chosen by really creating a file in it (access() said yes where the sandbox then refused:
+       11-02 iconservicesagent "mkdir /tmp/xdg-runtime-mesa-501 failed: Operation not permitted" -> vkCreateDevice FAILED,
+       and the newer ANV needs its anonymous file while the device is made). Candidates: the per-user temp folder, the
+       per-user cache folder (Metal's own caches live there, so GPU sandboxes - Chromium's - allow it), $TMPDIR,
+       ~/Library/Caches. If none takes a file, XDG_RUNTIME_DIR still points at the temp folder (never /tmp/xdg-runtime-mesa-*)
+       and the bridge's mkostemp/mkstemp hooks give Mesa a POSIX shared-memory file instead (nvmtl_drmbridge.h). */
+    if (nvmtl_vk_vendor() != 0x10de && !getenv("XDG_RUNTIME_DIR")) {   /* g15-intel: so para o ANV/RADV */
+        char cand[4][PATH_MAX]; int nc = 0; char td[PATH_MAX];
+        size_t tn = confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td);
+        if (tn > 0 && tn <= sizeof td) snprintf(cand[nc++], PATH_MAX, "%s", td);
+        tn = confstr(_CS_DARWIN_USER_CACHE_DIR, td, sizeof td);
+        if (tn > 0 && tn <= sizeof td) snprintf(cand[nc++], PATH_MAX, "%s/nvmtl-xdg", td);
+        const char *e = getenv("TMPDIR"); if (e && *e) snprintf(cand[nc++], PATH_MAX, "%s", e);
+        e = getenv("HOME"); if (e && *e) snprintf(cand[nc++], PATH_MAX, "%s/Library/Caches/nvmtl-xdg", e);
+        int pick = -1;
+        for (int i = 0; i < nc && pick < 0; i++) {
+            size_t l = strlen(cand[i]); while (l > 1 && cand[i][l - 1] == '/') cand[i][--l] = 0;
+            mkdir(cand[i], 0700);
+            char t[PATH_MAX + 32]; snprintf(t, sizeof t, "%s/.nvmtl-XXXXXX", cand[i]);
+            const int fd = mkstemp(t);
+            if (fd >= 0) { if (ftruncate(fd, 4096) == 0) pick = i; close(fd); unlink(t); }   /* b253: sizable too */
+        }
+        if (pick >= 0) { setenv("XDG_RUNTIME_DIR", cand[pick], 1); nvlog("vk: XDG_RUNTIME_DIR for Mesa = %s (%s)", cand[pick], getprogname()); }
+        else if (nc) { setenv("XDG_RUNTIME_DIR", cand[0], 1);
+            nvlog("drm bridge: anon dir: no folder takes a file in %s - Mesa's anonymous files go to shared memory", getprogname()); }
+    }
     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
+    if (g_lib && nvmtl_vk_vendor() != 0x10de) nmxbr_install();   /* b80 (IrisXe fork): /dev/dri over IOKit where a sandbox refuses it */
     if (g_lib) {
         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
         if (!pvkGetInstanceProcAddr)

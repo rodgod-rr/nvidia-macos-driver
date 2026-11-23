@@ -126,6 +126,10 @@ static int nvlog_dropped(const char *fmt, uint64_t *rep) {
     return 1;
 }
 const char *nvmtl_log_path(void) {
+    /* g15-intel: diagnostico do WindowServer na UHD - com o arquivo criado (macos-i915-armar.sh), todo processo loga nele,
+       inclusive os privilegiados, em /tmp/nvmtl.log (o que o WindowServer pode escrever); a marca e /Library/GPUBundles/nvmtl-g15log */
+    { static int g15 = -1; if (g15 < 0) g15 = access("/Library/GPUBundles/nvmtl-g15log", R_OK) == 0;
+      if (g15) return "/tmp/nvmtl.log"; }
 #if NVMTL_RELEASE
     // A release plugin writes no log unless this process opted into its own knobs (NVMTL_PROCESS_ENV=1).
     if (!nvmtl_process_env_on()) return "/private/tmp/nvmtl-off.log";
@@ -161,7 +165,7 @@ void nvlog_every(const char *fmt, ...) {
 static void nvlog_line(const char *t) {
 #if NVMTL_RELEASE
     if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
-    if (!nvmtl_process_env_on()) return;   // the file below is written only for a process that opted in
+    if (!nvmtl_process_env_on() && access("/Library/GPUBundles/nvmtl-g15log", R_OK) != 0) return;   // g15-intel: diagnostico (marca)
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
 #endif
